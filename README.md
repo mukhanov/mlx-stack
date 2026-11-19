@@ -28,11 +28,11 @@ The cask installs `MLX Stack.app` into `/Applications` and installs local-llm as
 Requirements: macOS 14+, Apple Silicon, Swift Command Line Tools.
 
 ```console
-./build.sh 0.1.0
+./build.sh 0.1.1
 open "build/MLX Stack.app"
 ```
 
-The script also creates `releases/MLXStack-v0.1.0.zip`, the artifact used by the Homebrew cask.
+The script also creates `releases/MLXStack-v0.1.1.zip`, the artifact used by the Homebrew cask.
 
 ## Runtime
 
