@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=${1:-0.1.1}
+VERSION=${1:-0.1.2}
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 APP="$ROOT/build/MLX Stack.app"
 BINARY="$APP/Contents/MacOS/MLXStack"
