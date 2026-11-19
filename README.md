@@ -6,6 +6,7 @@ Native macOS tray and desktop monitor for [local-llm](https://github.com/mukhano
 
 ```console
 brew tap mukhanov/local-llm
+brew trust mukhanov/local-llm
 brew install --cask mlx-stack
 open -a "MLX Stack"
 ```
