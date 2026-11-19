@@ -1,0 +1,60 @@
+#!/bin/sh
+# local-llm — launcher: sets up the venv (dependencies come from pyproject.toml)
+# and runs the package. All the logic lives in local_llm/.
+set -e
+# $0 may be a symlink (~/bin/local-llm -> this checkout): resolve it, or
+# APP_DIR becomes ~/bin and uv looks for pyproject.toml in the wrong place
+SELF=$0
+while [ -L "$SELF" ]; do
+  LINK_DIR=$(cd "$(dirname "$SELF")" && pwd -P)
+  SELF=$(readlink "$SELF")
+  case $SELF in
+    /*) ;;
+    *) SELF=$LINK_DIR/$SELF ;;
+  esac
+done
+APP_DIR=$(cd "$(dirname "$SELF")" && pwd -P)
+RESOURCES_DIR=$(CDPATH= cd -- "$APP_DIR/.." && pwd -P)
+OLLMLX="${OLLMLX_HOME:-$HOME/.ollmlx}"
+VENV="$OLLMLX/mlx-stack-venv"
+STAMP="$OLLMLX/mlx-stack-venv.deps"
+UV="$RESOURCES_DIR/bin/uv"
+if [ ! -x "$UV" ]; then
+  UV=$(command -v uv 2>/dev/null || true)
+fi
+[ -n "$UV" ] || {
+  echo "MLX Stack's bundled uv is missing; reinstall MLX Stack.app" >&2
+  exit 1
+}
+
+# Model helpers also need uv and a previously installed litellm under Finder's
+# minimal LaunchServices environment.
+PATH="$RESOURCES_DIR/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
+mkdir -p "$OLLMLX"
+if [ ! -x "$VENV/bin/python" ]; then
+  "$UV" venv "$VENV" --python 3.12
+  rm -f "$STAMP"
+fi
+
+# The app installs a regular, non-editable wheel: no Cellar or source checkout
+# path can disappear after an upgrade. Hash every source file because app
+# updates can change Python code without changing its dependencies.
+hash=$(
+  {
+    find "$APP_DIR/local_llm" -type f ! -name '*.pyc' \
+      ! -path '*/__pycache__/*' -exec shasum -a 256 {} +
+    shasum -a 256 "$APP_DIR/pyproject.toml"
+  } | sort | shasum -a 256 | cut -d' ' -f1
+)
+if [ "$(cat "$STAMP" 2>/dev/null)" != "$hash" ]; then
+  "$UV" pip install --python "$VENV/bin/python" \
+    --reinstall-package local-llm "$APP_DIR"
+  printf '%s\n' "$hash" > "$STAMP"
+fi
+
+if [ "${1-}" = "--widget-api" ]; then
+  exec "$VENV/bin/python" -m local_llm.widget
+fi
+exec "$VENV/bin/local-llm" "$@"

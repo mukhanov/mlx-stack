@@ -1,6 +1,6 @@
 # MLX Stack
 
-Native macOS tray and desktop monitor for [local-llm](https://github.com/mukhanov/local-llm). It shows live MLX/llama.cpp metrics, model context, CPU/RAM, processes and logs; it can also load downloaded models from the status-bar menu.
+Native macOS tray and desktop monitor with the complete local-llm backend bundled inside the app. It shows live MLX/llama.cpp metrics, model context, CPU/RAM, processes and logs; it can also load downloaded models from the status-bar menu.
 
 ## Install with Homebrew
 
@@ -11,7 +11,9 @@ brew install --cask mlx-stack
 open -a "MLX Stack"
 ```
 
-The cask installs `MLX Stack.app` into `/Applications` and installs local-llm as a dependency. Initialize local-llm once with `local-llm` before loading models.
+The cask installs only `MLX Stack.app` into `/Applications`. The backend and `uv` are bundled; no separate local-llm formula, Python installation or terminal setup is required.
+
+On first launch the app automatically creates `~/.ollmlx/mlx-stack-venv` and installs its Python dependencies. This initial setup requires internet access; later launches reuse it. Downloaded models, Hugging Face tokens, client configuration and logs remain in their existing locations.
 
 ## Features
 
@@ -25,18 +27,20 @@ The cask installs `MLX Stack.app` into `/Applications` and installs local-llm as
 
 ## Build from source
 
-Requirements: macOS 14+, Apple Silicon, Swift Command Line Tools.
+Requirements: macOS 14+, Apple Silicon, Swift Command Line Tools and [uv](https://docs.astral.sh/uv/) for the build only. The build bundles `uv` into the app.
 
 ```console
-./build.sh 0.1.2
+./build.sh 0.1.3
 open "build/MLX Stack.app"
 ```
 
-The script also creates `releases/MLXStack-v0.1.2.zip`, the artifact used by the Homebrew cask.
+The script also creates `releases/MLXStack-v0.1.3.zip`, the artifact used by the Homebrew cask.
 
 ## Runtime
 
-The app starts `~/.ollmlx/venv/bin/python -m local_llm.widget` as its snapshot API child. The API listens only on `127.0.0.1:19798` and stops when the app exits.
+`Contents/Resources/backend` contains the complete Python backend. At launch the app uses its bundled `uv` to prepare `~/.ollmlx/mlx-stack-venv`, install the backend as a non-editable package, and start `python -m local_llm.widget`. Model processes use the same isolated interpreter.
+
+The API listens only on `127.0.0.1:19798` and stops when the app exits. Bootstrap and API diagnostics are written to `~/.ollmlx/logs/mlx-stack.log`.
 
 ## License
 

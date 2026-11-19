@@ -71,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSLog("MLXStack applicationDidFinishLaunching")
         let view = ResizeGuardView()
         let host = NSHostingView(rootView: PanelView(model: model))
         host.autoresizingMask = [.width, .height]
@@ -103,35 +104,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installStatusItem()
     }
 
+    private var stoppingAPI = false
+
     private func startAPI() {
-        let python = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".ollmlx/venv/bin/python")
-        guard FileManager.default.fileExists(atPath: python.path) else {
-            let alert = NSAlert()
-            alert.messageText = "local-llm is not initialized"
-            alert.informativeText = "Run local-llm once, then reopen MLX Stack."
-            alert.alertStyle = .warning
-            alert.runModal()
+        guard let launcher = Bundle.main.resourceURL?
+            .appendingPathComponent("backend/launch-widget.sh") else {
+            NSLog("MLXStack bundled backend is missing")
             return
         }
+        NSLog("MLXStack API launcher %@", launcher.path)
+        let log = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".ollmlx/logs/mlx-stack.log").path
         let process = Process()
-        process.executableURL = python
-        process.arguments = ["-m", "local_llm.widget"]
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [launcher.path]
         var env = ProcessInfo.processInfo.environment
         env["WIDGET_PORT"] = String(model.port)
+        env.removeValue(forKey: "PYTHONHOME")
+        env.removeValue(forKey: "PYTHONPATH")
         process.environment = env
+        process.terminationHandler = { [weak self] process in
+            let status = process.terminationStatus
+            NSLog("MLXStack API exited with status %d", status)
+            DispatchQueue.main.async {
+                guard let self, !self.stoppingAPI else { return }
+                let alert = NSAlert()
+                alert.messageText = "The built-in backend stopped"
+                alert.informativeText = "Exit status \(status). See \(log)"
+                alert.alertStyle = .warning
+                alert.runModal()
+            }
+        }
         do {
             try process.run()
             apiProcess = process
+            NSLog("MLXStack API pid %d", process.processIdentifier)
         } catch {
+            NSLog("MLXStack API launch error %@", error.localizedDescription)
             let alert = NSAlert()
-            alert.messageText = "Cannot start the snapshot API"
+            alert.messageText = "Cannot start the built-in backend"
             alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
             alert.runModal()
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stoppingAPI = true
         if let apiProcess, apiProcess.isRunning {
             apiProcess.terminate()
         }
@@ -900,11 +919,14 @@ struct OfflineView: View {
                             .font(mono(12))
                             .foregroundStyle(C.dim)
                     } else {
-                        Text("waiting for the snapshot API on 127.0.0.1:\(model.port)")
+                        Text("starting the built-in backend on 127.0.0.1:\(model.port)")
                             .font(mono(14, .semibold))
                             .foregroundStyle(C.fg)
-                        Text("polling once per second…")
+                        Text("first launch prepares Python dependencies automatically")
                             .font(mono(12))
+                            .foregroundStyle(C.dim)
+                        Text("logs: ~/.ollmlx/logs/mlx-stack.log")
+                            .font(mono(11))
                             .foregroundStyle(C.dim)
                     }
                 }
