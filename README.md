@@ -30,11 +30,11 @@ On first launch the app automatically creates `~/.ollmlx/mlx-stack-venv` and ins
 Requirements: macOS 14+, Apple Silicon, Swift Command Line Tools and [uv](https://docs.astral.sh/uv/) for the build only. The build bundles `uv` into the app.
 
 ```console
-./build.sh 0.1.3
+./build.sh 0.1.4
 open "build/MLX Stack.app"
 ```
 
-The script also creates `releases/MLXStack-v0.1.3.zip`, the artifact used by the Homebrew cask.
+The script also creates `releases/MLXStack-v0.1.4.zip`, the artifact used by the Homebrew cask.
 
 ## Runtime
 

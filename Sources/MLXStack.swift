@@ -159,9 +159,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         guard let button = item.button else { return }
-        let image = NSImage(systemSymbolName: "terminal",
-                            accessibilityDescription: "MLX Stack")
-        image?.isTemplate = true
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            // The application icon's M ribbon, reduced to a legible menu-bar mark.
+            let mark = NSBezierPath()
+            mark.move(to: NSPoint(x: 2.5, y: 3))
+            mark.line(to: NSPoint(x: 6.2, y: 14.5))
+            mark.line(to: NSPoint(x: 9, y: 3))
+            mark.line(to: NSPoint(x: 11.8, y: 14.5))
+            mark.line(to: NSPoint(x: 15.5, y: 3))
+            mark.lineWidth = 3.2
+            mark.lineCapStyle = .round
+            mark.lineJoinStyle = .round
+            NSColor.black.setStroke()
+            mark.stroke()
+            return true
+        }
+        image.isTemplate = true
         button.image = image
         button.toolTip = "MLX Stack — monitor and models"
         button.setAccessibilityTitle("MLX Stack")
