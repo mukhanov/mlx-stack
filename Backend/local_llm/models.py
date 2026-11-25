@@ -56,26 +56,6 @@ QUANTS = (
     ("bf16", 2.05), ("fp16", 2.05), ("f16", 2.05),
 )
 
-_DESCRIPTIONS = (
-    ("Qwen3.8-27B-pi-adapted",
-     "Pi-tuned Qwen3.8 27B: Q8_0 GGUF base + LoRA, thinking off"),
-    ("Qwen3-0.6B", "Ultra-light, ~0.6B params, instant load"),
-    ("Qwen3-1.7B", "Light, ~1.7B params, fast generation"),
-    ("Qwen3-4B", "Compact, ~4B params, good balance"),
-    ("Qwen3-8B", "Optimal balance, ~8B params, high quality"),
-    ("Qwen3-32B", "High quality, ~32B params, needs 20GB+ RAM"),
-    ("Qwen3-30B-A3B", "MoE, ~30B total with 3B active, efficient"),
-    ("Qwen3-235B", "Huge model, ~235B params, best quality"),
-    ("Llama-3.1-8B", "Llama 3.1 8B, popular Meta model"),
-    ("Llama-3.2-1B", "Llama 3.2 1B, ultra-light version"),
-    ("gemma-2-9b", "Gemma 2 9B by Google, solid open model"),
-    ("Kimi-K2.5", "Kimi K2.5, strong long-context model"),
-    ("gpt-oss-20b", "Open-source GPT ~20B, MXFP4 quantized"),
-    ("Qwen2.5", "Qwen 2.5 series, predecessor of Qwen3"),
-    ("Qwen2", "Qwen 2 series, the classic version"),
-    ("Llama-3", "Llama 3 series by Meta"),
-)
-
 # rough RAM table (GB) for names without a recognized size; matched on
 # [-_.] word boundaries (a bare "4b" would otherwise match inside "4bit"),
 # longest pattern first ("30B-A3B" must win over "30B")
@@ -102,13 +82,6 @@ def recommend_for_ram(ram: int) -> str:
     if ram >= 8:
         return TOP_MODELS[8]
     return TOP_MODELS[4]
-
-
-def describe(model: str) -> str:
-    for pat, text in _DESCRIPTIONS:
-        if pat in model:
-            return text
-    return "MLX model for Apple Silicon"
 
 
 def parse_model(mid: str):

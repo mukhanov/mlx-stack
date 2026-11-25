@@ -1,8 +1,8 @@
 [project]
 name = "local-llm"
 dynamic = ["version"]
-description = "One command to run a local LLM on your Mac: model picker, MLX server, OpenAI + Anthropic APIs, Claude Code integration"
-readme = {text = "One command to run a local LLM on your Mac: a model picker ranked for your RAM, MLX or llama.cpp serving, OpenAI and Anthropic APIs on localhost, client config for pi / omp / Claude Code. https://github.com/mukhanov/local-llm", content-type = "text/plain"}
+description = "MLX Stack backend: a local model served over OpenAI and Anthropic APIs on localhost"
+readme = {text = "MLX Stack backend: MLX or llama.cpp serving sized for your RAM, OpenAI and Anthropic APIs on localhost, client config for pi / omp / opencode / Claude Code. https://github.com/mukhanov/mlx-stack", content-type = "text/plain"}
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
@@ -12,7 +12,7 @@ dependencies = [
     # 5.x already forbids 2.x (httpx2 rewrite); the cap keeps it explicit if
     # that ever changes — hf.py scans blobs/ and .incomplete files directly.
     "huggingface-hub>=1.0,<2.0",
-    # monitor: per-core CPU, process RSS
+    # desktop monitor: per-core CPU, process RSS
     "psutil>=5.9",
 ]
 
@@ -20,7 +20,7 @@ dependencies = [
 local-llm = "local_llm.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/mukhanov/local-llm"
+Homepage = "https://github.com/mukhanov/mlx-stack"
 
 [build-system]
 requires = ["hatchling"]

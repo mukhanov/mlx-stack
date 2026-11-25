@@ -1,14 +1,15 @@
-// MLXStack.swift — native desktop monitor panel for local-llm.
+// MLXStack.swift — the native app: a status-bar item and one window with the
+// Models, Monitor and Tools sections.
 //
-// Built by ./build.sh into build/MLX Stack.app.
-// The app owns its Python snapshot API child and needs no terminal.
+// Built by ./build.sh into build/MLX Stack.app. The app owns the Python
+// backend that ships inside the bundle (Backend/) and needs no terminal: it
+// starts the local API (python -m local_llm.widget), which starts the stack
+// — client proxy, main model and helper model — when a model is loaded.
 //
-// Reproduces the curses monitor (local_llm/monitor.py) as a borderless
-// desktop panel: it polls GET http://127.0.0.1:<port>/snapshot once a
-// second, keeps the same 240-sample histories and decode-only tok/s
-// logic, and renders the same sections — header chips, TOK/S main /
-// TOK/S small / CONTEXT graphs, CPU + cores, clients / processes,
-// MEM/SWP bars, top mem, logs (errors red). macOS 14+.
+// Monitor polls GET http://127.0.0.1:<port>/snapshot once a second, keeps
+// 240-sample histories and decode-only tok/s logic, and renders: header
+// chips, the summary, the Generation and Context usage panels, CPU + cores,
+// memory, processes, logs (errors red). macOS 14+.
 
 import AppKit
 import Foundation
@@ -26,7 +27,7 @@ struct MLXStackApp {
         let delegate = AppDelegate()
         retainedDelegate = delegate   // NSApplication.delegate is non-retaining
         app.delegate = delegate
-        app.setActivationPolicy(.accessory)   // no Dock icon, no menu bar
+        app.setActivationPolicy(.regular)   // Dock and ⌘Tab presence; no hiding on focus loss
         app.appearance = NSAppearance(named: .darkAqua)
         app.run()
     }
@@ -51,39 +52,90 @@ enum PortArg {
 }
 
 @MainActor
+final class AppNavigation: ObservableObject {
+    enum Screen { case models, monitor, tools }
+    @Published var screen: Screen = .models
+    @Published private(set) var hasChosenScreen = false
+
+    func show(_ screen: Screen) {
+        self.screen = screen
+        hasChosenScreen = true
+    }
+}
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let model = PanelModel(port: PortArg.value)
     var window: NSWindow?
     private var statusItem: NSStatusItem?
     private var apiProcess: Process?
+    private let navigation = AppNavigation()
+    private lazy var modelManager = ModelManagerModel(port: model.port)
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        // accessory apps get no main menu; ⌘Q needs one
         let menu = NSMenu()
         let appItem = NSMenuItem()
-        let appMenu = NSMenu(title: "MLXStack")
-        appMenu.addItem(withTitle: "Quit MLXStack",
+        let appMenu = NSMenu(title: "MLX Stack")
+        appMenu.addItem(withTitle: "About MLX Stack",
+                        action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit MLX Stack",
                         action: #selector(NSApplication.terminate(_:)),
                         keyEquivalent: "q")
         appItem.submenu = appMenu
         menu.addItem(appItem)
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)),
+                         keyEquivalent: "c")
+        let pasteItem = NSMenuItem(title: "Paste",
+                                   action: #selector(pasteIntoSearch(_:)),
+                                   keyEquivalent: "v")
+        pasteItem.target = self
+        editMenu.addItem(pasteItem)
+        editItem.submenu = editMenu
+        menu.addItem(editItem)
+        let windowItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        let models = NSMenuItem(title: "Models", action: #selector(showModelManager),
+                                keyEquivalent: "1")
+        models.target = self
+        models.keyEquivalentModifierMask = [.command]
+        windowMenu.addItem(models)
+        let monitor = NSMenuItem(title: "Monitor", action: #selector(showMonitor),
+                                 keyEquivalent: "2")
+        monitor.target = self
+        monitor.keyEquivalentModifierMask = [.command]
+        windowMenu.addItem(monitor)
+        let tools = NSMenuItem(title: "Tools", action: #selector(showTools),
+                               keyEquivalent: "3")
+        tools.target = self
+        tools.keyEquivalentModifierMask = [.command]
+        windowMenu.addItem(tools)
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: "Minimize",
+                           action: #selector(NSWindow.miniaturize(_:)),
+                           keyEquivalent: "m")
+        windowItem.submenu = windowMenu
+        menu.addItem(windowItem)
         NSApplication.shared.mainMenu = menu
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("MLXStack applicationDidFinishLaunching")
-        let view = ResizeGuardView()
-        let host = NSHostingView(rootView: PanelView(model: model))
+        let host = NSHostingView(rootView: AppRootView(
+            panel: model, manager: modelManager, navigation: navigation))
         host.autoresizingMask = [.width, .height]
-        view.addSubview(host)
 
-        let w = PanelWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 800),
-            styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        let w = NSWindow(
+            contentRect: Self.initialWindowFrame(),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered, defer: false)
         w.title = "MLX Stack"
         w.sharingType = .readOnly
-        w.isOpaque = false
-        w.backgroundColor = .clear
+        w.isOpaque = true
+        w.backgroundColor = .windowBackgroundColor
         w.hasShadow = true
         w.hidesOnDeactivate = false
         w.isMovableByWindowBackground = true
@@ -91,19 +143,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Ordinary non-modal window: other apps can cover and activate freely.
         // Joins every (non-fullscreen) Space without floating above them.
         w.collectionBehavior = [.canJoinAllSpaces, .ignoresCycle]
-        w.minSize = NSSize(width: 900, height: 700)
-        w.contentMinSize = NSSize(width: 900, height: 700)
-        w.contentView = view
-        w.center()
+        w.minSize = NSSize(width: 980, height: 520)
+        w.contentMinSize = NSSize(width: 980, height: 520)
+        w.isReleasedWhenClosed = false
+        w.contentView = host
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         window = w
-
         startAPI()
         model.start()
         installStatusItem()
     }
-
     private var stoppingAPI = false
 
     private func startAPI() {
@@ -113,8 +163,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         NSLog("MLXStack API launcher %@", launcher.path)
-        let log = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".ollmlx/logs/mlx-stack.log").path
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = [launcher.path]
@@ -128,11 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSLog("MLXStack API exited with status %d", status)
             DispatchQueue.main.async {
                 guard let self, !self.stoppingAPI else { return }
-                let alert = NSAlert()
-                alert.messageText = "The built-in backend stopped"
-                alert.informativeText = "Exit status \(status). See \(log)"
-                alert.alertStyle = .warning
-                alert.runModal()
+                self.showBackendFailure("The local model service exited with status \(status).")
             }
         }
         do {
@@ -141,11 +185,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSLog("MLXStack API pid %d", process.processIdentifier)
         } catch {
             NSLog("MLXStack API launch error %@", error.localizedDescription)
-            let alert = NSAlert()
-            alert.messageText = "Cannot start the built-in backend"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle = .warning
-            alert.runModal()
+            showBackendFailure("The local model service could not start. \(error.localizedDescription)")
+        }
+    }
+
+    private func showBackendFailure(_ detail: String) {
+        let alert = NSAlert()
+        alert.messageText = "MLX Stack backend stopped"
+        alert.informativeText = detail + " Open the log to inspect the problem, then relaunch MLX Stack."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Show Log")
+        alert.addButton(withTitle: "OK")
+        if alert.runModal() == .alertFirstButtonReturn {
+            let log = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".mlx-stack/logs/mlx-stack.log")
+            NSWorkspace.shared.activateFileViewerSelecting([log])
         }
     }
 
@@ -154,6 +208,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let apiProcess, apiProcess.isRunning {
             apiProcess.terminate()
         }
+    }
+
+    private static func initialWindowFrame() -> NSRect {
+        let screen = NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+        let width = min(1180, screen.width - 40)
+        let height = min(800, screen.height - 40)
+        return NSRect(x: screen.midX - width / 2,
+                      y: screen.midY - height / 2,
+                      width: width, height: height)
+    }
+
+    private func presentWindow() {
+        guard let window else { return }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func installStatusItem() {
@@ -185,17 +256,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        window?.makeKeyAndOrderFront(nil)
-        DispatchQueue.main.async {
-            NSApp.activate(ignoringOtherApps: true)
-            self.window?.makeKeyAndOrderFront(nil)
-        }
         menu.removeAllItems()
         let open = NSMenuItem(
-            title: window?.isVisible == true ? "Hide monitor" : "Open monitor",
+            title: window?.isVisible == true ? "Hide MLX Stack" : "Open MLX Stack",
             action: #selector(togglePanel), keyEquivalent: "")
         open.target = self
         menu.addItem(open)
+        let manage = NSMenuItem(title: "Manage models",
+                                action: #selector(showModelManager), keyEquivalent: "")
+        manage.target = self
+        menu.addItem(manage)
         menu.addItem(.separator())
 
         let title = model.canSwitch ? "Load model" : "Models — terminal stack active"
@@ -224,9 +294,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quit)
     }
 
+    @objc private func pasteIntoSearch(_ sender: Any?) {
+        guard let text = NSPasteboard.general.string(forType: .string) else { return }
+        modelManager.query = text
+    }
+
+    @objc private func showModelManager() {
+        navigation.show(.models)
+        presentWindow()
+    }
+
+    @objc private func showMonitor() {
+        navigation.show(.monitor)
+        presentWindow()
+    }
+
+    @objc private func showTools() {
+        navigation.show(.tools)
+        presentWindow()
+    }
+
     @objc private func selectModel(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
         model.runModel(name)
+        navigation.screen = .models
     }
 
     @objc private func quit() {
@@ -235,131 +326,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func togglePanel() {
         guard let window else { return }
-        if window.isVisible {
+        if window.isMiniaturized {
+            presentWindow()
+        } else if window.isVisible {
             window.orderOut(nil)
         } else {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            presentWindow()
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        presentWindow()
+        return false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false   // the status item owns the app lifetime; Cmd+Q terminates
-    }
-}
-
-// MARK: - borderless window with real edge resizing
-
-final class PanelWindow: NSWindow {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-}
-
-/// Content-view wrapper that owns an 7pt resize rim around the hosted
-/// SwiftUI panel: borderless windows get no AppKit resize tracking, and
-/// interior clicks still fall through to the window background drag.
-final class ResizeGuardView: NSView {
-    private let rim: CGFloat = 7
-
-    override var acceptsFirstResponder: Bool { true }
-    override var isFlipped: Bool { false }
-
-    private func zone(_ p: NSPoint) -> (left: Bool, right: Bool, bottom: Bool, top: Bool) {
-        let b = bounds
-        return (p.x < rim, p.x > b.maxX - rim, p.y < rim, p.y > b.maxY - rim)
-    }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        let z = zone(point)
-        if z.left || z.right || z.bottom || z.top { return self }
-        if point.y > bounds.height - 55 { return self }  // header drag strip
-        return super.hitTest(point)
-    }
-
-    override func resetCursorRects() {
-        let b = bounds
-        addCursorRect(NSRect(x: 0, y: 0, width: b.width, height: rim), cursor: .resizeUpDown)
-        addCursorRect(NSRect(x: 0, y: b.height - rim, width: b.width, height: rim),
-                      cursor: .resizeUpDown)
-        addCursorRect(NSRect(x: 0, y: 0, width: rim, height: b.height), cursor: .resizeLeftRight)
-        addCursorRect(NSRect(x: b.width - rim, y: 0, width: rim, height: b.height),
-                      cursor: .resizeLeftRight)
-        addCursorRect(NSRect(x: rim, y: b.height - 55, width: b.width - 2 * rim,
-                             height: 55 - rim), cursor: .openHand)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        guard let window = window else { return }
-        let point = convert(event.locationInWindow, from: nil)
-        let z = zone(point)
-        guard z.left || z.right || z.bottom || z.top else {
-            if point.y > bounds.height - 55 {
-                let startMouse = NSEvent.mouseLocation
-                let origin = window.frame.origin
-                while let ev = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
-                    if ev.type == .leftMouseUp { break }
-                    let current = NSEvent.mouseLocation
-                    window.setFrameOrigin(NSPoint(
-                        x: origin.x + current.x - startMouse.x,
-                        y: origin.y + current.y - startMouse.y))
-                }
-            } else {
-                super.mouseDown(with: event)
-            }
-            return
-        }
-        let startMouse = NSEvent.mouseLocation
-        let f0 = window.frame
-        let minW = window.contentMinSize.width
-        let minH = window.contentMinSize.height
-        while true {
-            guard let ev = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else {
-                break
-            }
-            if ev.type == .leftMouseUp { break }
-            let m = NSEvent.mouseLocation
-            let dx = m.x - startMouse.x
-            let dy = m.y - startMouse.y
-            var width = f0.width
-            var height = f0.height
-            var x = f0.minX
-            var y = f0.minY
-            if z.right { width = max(minW, f0.width + dx) }
-            if z.top { height = max(minH, f0.height + dy) }
-            if z.left { width = max(minW, f0.width - dx); x = f0.maxX - width }
-            if z.bottom { height = max(minH, f0.height - dy); y = f0.maxY - height }
-            window.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
-        }
-    }
-
-    override func layout() {
-        super.layout()
-        if let host = subviews.first {
-            host.frame = bounds
-        }
-    }
-}
-
-/// Native wheel/trackpad events for the terminal-style log scrollback.
-struct ScrollWheelTarget: NSViewRepresentable {
-    let onScroll: (Double) -> Void
-
-    func makeNSView(context: Context) -> WheelTargetView {
-        let view = WheelTargetView()
-        view.onScroll = onScroll
-        return view
-    }
-
-    func updateNSView(_ view: WheelTargetView, context: Context) {
-        view.onScroll = onScroll
-    }
-}
-
-final class WheelTargetView: NSView {
-    var onScroll: (Double) -> Void = { _ in }
-
-    override func scrollWheel(with event: NSEvent) {
-        onScroll(event.scrollingDeltaY)
     }
 }
 
@@ -388,7 +370,7 @@ struct Snapshot: Decodable {
     struct Ports: Decodable {
         let main: Port
         let small: Port?
-        let litellm: Port
+        let proxy: Port
     }
 
     struct CPU: Decodable {
@@ -438,11 +420,16 @@ struct Snapshot: Decodable {
         let summary: String
         let context: Int?
         let active: Int?
+        let requests: Int
     }
 
     struct Client: Decodable {
         let name: String
         let command: String
+        let configPath: String?
+        let apiBase: String?
+        let model: String?
+        let role: String?
     }
 
     struct LogLine: Decodable {
@@ -451,10 +438,18 @@ struct Snapshot: Decodable {
         let error: Bool
     }
 
+    struct LaunchError: Decodable {
+        let model: String
+        let status: Int
+    }
+
     let model: String
+    let smallModel: String?
+    let launchError: LaunchError?
     let backend: String
     let uptimeSeconds: Int
     let maxInput: Int
+    let configHome: String?
     let availableModels: [String]
     let canSwitch: Bool
     let ports: Ports
@@ -470,13 +465,15 @@ struct Snapshot: Decodable {
     let logs: [LogLine]
 }
 
-// MARK: - local histories (the curses deques, 240 samples)
+// MARK: - local histories (240 samples, four minutes at one per second)
+
+let historySeconds = 240
 
 struct Ring {
     private(set) var values: [Double] = []
     private let cap: Int
 
-    init(capacity: Int = 240) {
+    init(capacity: Int = historySeconds) {
         self.cap = capacity
     }
 
@@ -486,11 +483,17 @@ struct Ring {
             values.removeFirst(values.count - cap)
         }
     }
-
-    var maxV: Double { values.max() ?? 0 }
 }
 
-/// Per-model decode state, mirroring monitor.py's `tok` dicts.
+/// What one second of a model's life looked like, sampled once per poll.
+enum Activity {
+    static let idle: Double = 0        // no request in flight: waiting for the client
+    static let stalled: Double = 1     // request in flight, no token progress this second
+    static let prefill: Double = 2     // prompt being processed
+    static let decode: Double = 3      // tokens being generated
+}
+
+/// Per-model decode state: which seq numbers were last seen and what they showed.
 struct TokSt {
     var liveSeq = -1
     var preSeq = -1
@@ -501,11 +504,26 @@ struct TokSt {
     var peak = 0.0
 }
 
+struct RequestSt {
+    var total = 0
+    var current = 0
+    var initialized = false
+    var lastRequest: Date?
+    var averageInterval: Double?
+}
+
 // MARK: - immutable view model built once per poll
 
 struct Chip {
-    let text: String
+    let service: String
+    let port: Int
     let up: Bool
+}
+
+enum MonitorModel: String, CaseIterable, Identifiable {
+    case main, small
+    var id: String { rawValue }
+    var title: String { self == .main ? "Main" : "Small" }
 }
 
 struct Row {
@@ -514,44 +532,74 @@ struct Row {
 }
 
 struct TokCol {
-    let title: String                 // "TOK/S main"
-    let barFrac: Double
-    let barSuffix: String             // "]  12.3 tok/s"
-    let boxTitle: String              // " tok/s 0–75 · avg 80 · max 120 "
-    let samples: [Double]
+    let samples: [Double]              // decode tok/s per second, 0 while not generating
     let scale: Double
-    let footer: String                // "last: …" / placeholder
+    let cur: Double
+    let txt: String
+    let avg: Double?                   // mean over the seconds that were generating
+    let peak: Double
+    let footer: String
+}
+
+struct RequestCol {
+    let samples: [Double]              // requests started per second
+    let total: Int
+    let perMinute: Double              // since the model was loaded
+    let lastAgo: Double?
+    let averageInterval: Double?
+}
+
+/// Shares of the history window the model spent in each activity.
+struct ActivityCol {
+    let samples: [Double]
+    let generating: Double
+    let reading: Double
+    let waiting: Double
 }
 
 struct CtxCol {
     let barFrac: Double
     let barSuffix: String             // "] 4.1K/110K"
     let samples: [Double]
-    let scale: Double                 // max_input (or observed max)
+    let scale: Double                 // graph scale, dynamic
+    let capacity: Double              // absolute context cap
+    let current: Int
     let footer: String                // "TTFT … · uncached … · active …"
 }
 
 struct Derived {
     let model: String
+    let smallModel: String?
     let uptime: String
+    let configHome: String
     let chips: [Chip]
     let coreCount: Int
     let tokMain: TokCol
     let tokSmall: TokCol?
+    let requestsMain: RequestCol
+    let requestsSmall: RequestCol?
+    let activityMain: ActivityCol
+    let activitySmall: ActivityCol?
+    let activeRequests: Int?
+    let activeRequestsSmall: Int?
     let ctx: CtxCol
+    let ctxSmall: CtxCol?
     let cpuTotal: Double
     let cpuSuffix: String
     let cpuHist: [Double]
     let cores: [Double]
-    let clients: [(name: String, command: String)]
+    let clients: [Snapshot.Client]
     let procRows: [Row]
+    let othersBytes: Int64
     let memFrac: Double
     let memSuffix: String
+    let memoryDetail: String
     let memLow: Bool
     let swapFrac: Double?
     let swapSuffix: String?
     let topMem: Row?
     let logRows: [Row]
+    let errorCount: Int
 }
 
 // MARK: - poller + state machine
@@ -567,16 +615,33 @@ final class PanelModel: ObservableObject {
     @Published private(set) var canSwitch = false
     @Published private(set) var mainRunning = false
     @Published private(set) var modelActionInProgress = false
-    @Published var logOffset = 0
-    var scrollRemainder = 0.0
+    @Published private(set) var loadingModel: String?
+    @Published private(set) var loadError: Snapshot.LaunchError?
+    @Published var actionError: String?
+    @Published var copiedCommand: String?
+    @Published var selectedModel: MonitorModel = .main
+    @Published var showCPUCores = false
+    @Published var showProcesses = false
+    @Published var showLogs = false
 
     private var tokMain = TokSt()
+    private var ctxSmallCur = 0
+    private var ringCtxS = Ring()
     private var tokSmall = TokSt()
     private var ringTok = Ring()
     private var ringTokS = Ring()
+    private var ringRequests = Ring()
+    private var ringRequestsS = Ring()
+    private var ringActivity = Ring()
+    private var ringActivityS = Ring()
+    private var requestMain = RequestSt()
+    private var requestSmall = RequestSt()
     private var ringCtx = Ring()
     private var ringCpu = Ring()
     private var ctxCur = 0
+    private var lastModel: String?
+    private var lastSmallModel: String?
+    private var lastUptime: Int?
 
     private let session: URLSession
     private var pollTask: Task<Void, Never>?
@@ -608,6 +673,8 @@ final class PanelModel: ObservableObject {
         guard canSwitch, !modelActionInProgress,
               let url = URL(string: "http://127.0.0.1:\(port)/run") else { return }
         modelActionInProgress = true
+        actionError = nil
+        loadError = nil
         Task {
             defer { modelActionInProgress = false }
             do {
@@ -625,12 +692,44 @@ final class PanelModel: ObservableObject {
                                       payload?["error"] ?? "model launch failed"])
                 }
             } catch {
-                let alert = NSAlert()
-                alert.messageText = "Cannot load model"
-                alert.informativeText = error.localizedDescription
-                alert.alertStyle = .warning
-                alert.runModal()
+                if loadingModel == name { loadingModel = nil }
+                actionError = "Couldn't load \(name). \(error.localizedDescription)"
             }
+        }
+    }
+
+    func unloadModel(_ name: String) {
+        guard !modelActionInProgress,
+              let url = URL(string: "http://127.0.0.1:\(port)/stop") else { return }
+        modelActionInProgress = true
+        actionError = nil
+        Task {
+            defer { modelActionInProgress = false }
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try JSONSerialization.data(withJSONObject: ["model": name])
+                let (data, response) = try await session.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if status != 200 {
+                    let payload = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+                    throw NSError(domain: "MLXStack", code: status,
+                                  userInfo: [NSLocalizedDescriptionKey:
+                                      payload?["error"] ?? "model unload failed"])
+                }
+            } catch {
+                actionError = "Couldn't unload \(name). \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func copyClient(_ command: String) {
+        copyText(command)
+        copiedCommand = command
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            if copiedCommand == command { copiedCommand = nil }
         }
     }
 
@@ -648,10 +747,11 @@ final class PanelModel: ObservableObject {
         }
     }
 
-    /// Same decode bookkeeping as monitor.py's draw_toks(): a changed
-    /// live_seq shows live_rate (and feeds the graph), a changed pre_seq
-    /// shows prefill, anything else decays to idle after 3 grace ticks.
-    private func stepTok(_ st: inout TokSt, _ p: Snapshot.Perf, _ ring: inout Ring) {
+    /// One poll of decode bookkeeping: a changed live_seq shows live_rate
+    /// (and feeds the graph), a changed pre_seq shows prefill, anything else
+    /// decays to idle after 3 grace ticks. Returns whether this poll saw new
+    /// tokens / new prefill progress.
+    private func stepTok(_ st: inout TokSt, _ p: Snapshot.Perf, _ ring: inout Ring) -> (live: Bool, pre: Bool) {
         let liveNew = p.liveSeq != st.liveSeq
         let preNew = p.preSeq != st.preSeq
         if liveNew {
@@ -675,6 +775,7 @@ final class PanelModel: ObservableObject {
         st.summary = p.summary
         // decode-only graph: zeros mark idle/prefill periods
         ring.append(liveNew ? p.liveRate : 0.0)
+        return (liveNew, preNew)
     }
 
     private func stepIdle(_ st: inout TokSt, _ ring: inout Ring) {
@@ -686,49 +787,115 @@ final class PanelModel: ObservableObject {
         ring.append(0.0)
     }
 
-    private func tokCol(_ title: String, _ st: TokSt, _ ring: Ring) -> TokCol {
-        var scale = 25.0
-        let tmax = ring.maxV
-        if tmax > 0 {
-            scale = max(25.0, Double((Int(tmax) + 24) / 25 * 25))   // ceil to a 25 step
+    private func stepRequests(_ state: inout RequestSt, _ count: Int, ring: inout Ring) {
+        if state.initialized {
+            state.current = count >= state.total ? count - state.total : count
+            if count > state.total {
+                let now = Date()
+                if let last = state.lastRequest {
+                    let interval = now.timeIntervalSince(last)
+                    state.averageInterval = state.averageInterval.map {
+                        $0 * 0.8 + interval * 0.2
+                    } ?? interval
+                }
+                state.lastRequest = now
+            }
+        } else {
+            state.initialized = true
+            state.current = 0
         }
-        let active = ring.values.filter { $0 > 0 }
-        let avg = active.isEmpty
-            ? "–"
-            : String(format: "%.0f", active.reduce(0, +) / Double(active.count))
-        var boxTitle = " tok/s 0–\(Int(scale)) "
-        if st.peak > 0 {
-            boxTitle = " tok/s 0–\(Int(scale)) · avg \(avg) · max \(String(format: "%.0f", st.peak)) "
-        }
-        let footer = st.summary.isEmpty
-            ? "no completions yet — tok/s appears during generation"
-            : "last: " + st.summary
-        return TokCol(title: title,
-                      barFrac: scale > 0 ? min(1, max(0, st.cur / scale)) : 0,
-                      barSuffix: "] \(st.txt)",
-                      boxTitle: boxTitle,
-                      samples: ring.values,
-                      scale: scale,
-                      footer: footer)
+        state.total = count
+        ring.append(Double(state.current))
+    }
+
+    private func requestCol(_ state: RequestSt, _ ring: Ring, uptime: Int) -> RequestCol {
+        RequestCol(samples: ring.values,
+                   total: state.total,
+                   perMinute: uptime > 0 ? Double(state.total) / Double(uptime) * 60 : 0,
+                   lastAgo: state.lastRequest.map { Date().timeIntervalSince($0) },
+                   averageInterval: state.averageInterval)
+    }
+
+    private func activityCol(_ ring: Ring) -> ActivityCol {
+        let n = ring.values.count
+        func share(_ matches: [Double]) -> Double { n > 0 ? Double(matches.count) / Double(n) : 0 }
+        return ActivityCol(samples: ring.values,
+                           generating: share(ring.values.filter { $0 == Activity.decode }),
+                           reading: share(ring.values.filter { $0 == Activity.prefill || $0 == Activity.stalled }),
+                           waiting: share(ring.values.filter { $0 == Activity.idle }))
+    }
+
+    private func tokCol(_ st: TokSt, _ ring: Ring) -> TokCol {
+        let generating = ring.values.filter { $0 > 0 }
+        return TokCol(samples: ring.values,
+                      // a multiple of 50 keeps the half-scale tick a whole number
+                      scale: dynamicScale(ring.values, minimum: 50, step: 50),
+                      cur: st.cur,
+                      txt: st.txt,
+                      avg: generating.isEmpty ? nil : generating.reduce(0, +) / Double(generating.count),
+                      peak: st.peak,
+                      footer: st.summary.isEmpty
+                          ? "no completions yet — tok/s appears during generation"
+                          : "last: " + st.summary)
+    }
+
+    /// Token progress wins, then a request in flight, else the model is idle.
+    private static func activity(live: Bool, pre: Bool, inFlight: Int) -> Double {
+        live ? Activity.decode : pre ? Activity.prefill : inFlight > 0 ? Activity.stalled : Activity.idle
     }
 
     private func apply(_ snap: Snapshot) {
+        let restarted = lastUptime.map { snap.uptimeSeconds < $0 } ?? false
+        if lastModel != snap.model || lastSmallModel != snap.smallModel || restarted {
+            tokMain = TokSt()
+            tokSmall = TokSt()
+            requestMain = RequestSt()
+            requestSmall = RequestSt()
+            ringTok = Ring()
+            ringTokS = Ring()
+            ringRequests = Ring()
+            ringRequestsS = Ring()
+            ringActivity = Ring()
+            ringActivityS = Ring()
+            ringCtx = Ring()
+            ringCtxS = Ring()
+            ctxCur = 0
+            ctxSmallCur = 0
+        }
+        lastModel = snap.model
+        lastSmallModel = snap.smallModel
+        lastUptime = snap.uptimeSeconds
         availableModels = snap.availableModels
         canSwitch = snap.canSwitch
         mainRunning = snap.ports.main.up
-        stepTok(&tokMain, snap.main, &ringTok)
+        let mainStep = stepTok(&tokMain, snap.main, &ringTok)
+        stepRequests(&requestMain, snap.main.requests, ring: &ringRequests)
+        ringActivity.append(Self.activity(live: mainStep.live, pre: mainStep.pre,
+                                          inFlight: snap.main.active ?? 0))
         if let sp = snap.small {
-            stepTok(&tokSmall, sp, &ringTokS)
+            let smallStep = stepTok(&tokSmall, sp, &ringTokS)
+            stepRequests(&requestSmall, sp.requests, ring: &ringRequestsS)
+            ringActivityS.append(Self.activity(live: smallStep.live, pre: smallStep.pre,
+                                               inFlight: sp.active ?? 0))
         } else if snap.ports.small != nil {
             stepIdle(&tokSmall, &ringTokS)
+            ringRequestsS.append(0)
+            ringActivityS.append(Activity.idle)
         }
         if let c = snap.main.context { ctxCur = c }
         ringCtx.append(Double(ctxCur))
+        if let sp = snap.small {
+            if let c = sp.context { ctxSmallCur = c }
+            ringCtxS.append(Double(ctxSmallCur))
+        } else {
+            ringCtxS.append(0)
+        }
         ringCpu.append(snap.cpu.total)
 
-        let chips: [Chip] = [snap.ports.main, snap.ports.small, snap.ports.litellm]
+        let serviceNames = ["mlx": "Main API", "small": "Helper API", "proxy": "Client proxy"]
+        let chips: [Chip] = [snap.ports.main, snap.ports.small, snap.ports.proxy]
             .compactMap { $0 }
-            .map { Chip(text: "\($0.label) :\($0.port) \($0.up ? "●up" : "○down")", up: $0.up) }
+            .map { Chip(service: serviceNames[$0.label] ?? $0.label, port: $0.port, up: $0.up) }
 
         // context: latest non-nil context against the hard cap
         let total = snap.maxInput > 0 ? Double(snap.maxInput) : Double(max(ctxCur, 1))
@@ -752,8 +919,19 @@ final class PanelModel: ObservableObject {
         let ctx = CtxCol(barFrac: min(1, Double(ctxCur) / total),
                          barSuffix: "] \(tokens(ctxCur))/\(tokens(Int(total)))",
                          samples: ringCtx.values,
-                         scale: total,
+                         scale: dynamicScale(ringCtx.values, minimum: 4096, step: 2048),
+                         capacity: total,
+                         current: ctxCur,
                          footer: "TTFT \(ttft) · uncached \(missed) · active \(activeTxt)")
+        let smallScale = dynamicScale(ringCtxS.values, minimum: 4096, step: 2048)
+        let ctxSmall = CtxCol(barFrac: min(1, Double(ctxSmallCur) / smallScale),
+                              barSuffix: "] \(tokens(ctxSmallCur))",
+                              samples: ringCtxS.values,
+                              scale: smallScale,
+                              capacity: total,
+                              current: ctxSmallCur,
+                              footer: "Small model context")
+        let activeSmallRequests = snap.small?.active
 
         // process table + RAM ledger
         var procRows: [Row] = snap.processes.map { p in
@@ -771,11 +949,11 @@ final class PanelModel: ObservableObject {
                     + " · available \(humanBytes(snap.memory.available))",
                  color: heat(snap.memory.percent)))
         } else {
-            procRows.append(Row(text: "no mlx/litellm processes found", color: C.red))
+            procRows.append(Row(text: "no model processes found", color: C.red))
         }
 
         // memory / swap
-        let low = snap.memory.available < 10 * 1_073_741_824   // LOW_AVAILABLE_GB
+        let low = snap.memory.available < 10 * 1_073_741_824   // below 10 GB free a Metal eval can OOM
         let memSuffix = low
             ? String(format: "] %3.0f%%  ⚠ OOM risk: %@ free",
                      snap.memory.percent, humanBytes(snap.memory.available))
@@ -799,6 +977,7 @@ final class PanelModel: ObservableObject {
                   color: low ? C.red : C.dim)
 
         // errors red, then the dim tail
+        let errorCount = snap.logs.filter(\.error).count
         var logRows = snap.logs.map {
             Row(text: "[\($0.tag)] \($0.text)", color: $0.error ? C.red : C.dim)
         }
@@ -808,31 +987,51 @@ final class PanelModel: ObservableObject {
 
         derived = Derived(
             model: snap.model,
+            smallModel: snap.smallModel,
             uptime: fmtUptime(snap.uptimeSeconds),
+            configHome: snap.configHome ?? (FileManager.default.homeDirectoryForCurrentUser.path + "/.mlx-stack"),
             chips: chips,
             coreCount: snap.cpu.cores.count,
-            tokMain: tokCol("TOK/S main", tokMain, ringTok),
-            tokSmall: snap.ports.small != nil
-                ? tokCol("TOK/S small", tokSmall, ringTokS)
+            tokMain: tokCol(tokMain, ringTok),
+            tokSmall: snap.ports.small != nil ? tokCol(tokSmall, ringTokS) : nil,
+            requestsMain: requestCol(requestMain, ringRequests, uptime: snap.uptimeSeconds),
+            requestsSmall: snap.ports.small != nil
+                ? requestCol(requestSmall, ringRequestsS, uptime: snap.uptimeSeconds)
                 : nil,
+            activityMain: activityCol(ringActivity),
+            activitySmall: snap.ports.small != nil ? activityCol(ringActivityS) : nil,
+            activeRequests: snap.main.active,
+            activeRequestsSmall: activeSmallRequests,
             ctx: ctx,
+            ctxSmall: ctxSmall,
             cpuTotal: snap.cpu.total,
             cpuSuffix: String(format: "] %5.1f%%", snap.cpu.total),
             cpuHist: ringCpu.values,
             cores: snap.cpu.cores,
-            clients: snap.clients.map { ($0.name, $0.command) },
+            clients: snap.clients,
             procRows: procRows,
+            othersBytes: snap.processSummary.others,
             memFrac: snap.memory.percent / 100,
             memSuffix: memSuffix,
+            memoryDetail: "Used \(humanBytes(snap.memory.used)) of \(humanBytes(snap.memory.total)) · \(humanBytes(snap.memory.available)) available",
             memLow: low,
             swapFrac: swapFrac,
             swapSuffix: swapSuffix,
             topMem: topMem,
-            logRows: logRows)
+            logRows: logRows,
+            errorCount: errorCount)
+        if let error = snap.launchError, error.model == loadingModel {
+            loadingModel = nil
+            loadError = error
+        }
+        if loadingModel == snap.model, snap.ports.main.up {
+            loadingModel = nil
+            loadError = nil
+        }
     }
 }
 
-// MARK: - formatting (same shapes as ui.py / monitor.py)
+// MARK: - formatting (same shapes as the backend's ui.py)
 
 enum C {
     static let green = Color(red: 0.30, green: 0.85, blue: 0.45)
@@ -840,12 +1039,21 @@ enum C {
     static let red = Color(red: 0.96, green: 0.38, blue: 0.34)
     static let cyan = Color(red: 0.38, green: 0.85, blue: 0.95)
     static let fg = Color(white: 0.86)
-    static let dim = Color(white: 0.52)
+    static let dim = Color(white: 0.60)
     static let barBg = Color(white: 0.24)
 }
 
 func heat(_ pct: Double) -> Color {   // green -> yellow -> red
     pct < 60 ? C.green : pct < 85 ? C.yellow : C.red
+}
+
+func percent(_ fraction: Double) -> String {
+    String(format: "%.0f%%", fraction * 100)
+}
+
+func copyText(_ text: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
 }
 
 func mono(_ size: CGFloat = 12, _ weight: Font.Weight = .regular) -> Font {
@@ -864,7 +1072,7 @@ func humanBytes(_ n: Int64) -> String {
     return String(format: "%.1fG", v)
 }
 
-/// monitor.py's tokens(): 999 -> "999", 1500 -> "2K", 15000 -> "15.0K".
+/// Compact token counts: 999 -> "999", 1500 -> "2K", 15000 -> "15.0K".
 func tokens(_ n: Int) -> String {
     if n >= 10000 { return String(format: "%.1fK", Double(n) / 1000) }
     if n >= 1000 { return String(format: "%.0fK", Double(n) / 1000) }
@@ -877,6 +1085,19 @@ func fmtUptime(_ s: Int) -> String {
                  : String(format: "%d:%02d", m, sec)
 }
 
+func durationText(_ seconds: Double) -> String {
+    seconds < 60 ? String(format: "%.1fs", seconds)
+                 : String(format: "%.1fm", seconds / 60)
+}
+
+func dynamicScale(_ samples: [Double], minimum: Double, step: Double,
+                  headroom: Double = 1.15) -> Double {
+    let maxValue = samples.max() ?? 0
+    if maxValue <= minimum { return minimum }
+    let target = max(minimum, maxValue * headroom)
+    return max(minimum, (target / step).rounded(.up) * step)
+}
+
 func rpad(_ s: String, _ n: Int) -> String {
     s.count >= n ? s : s + String(repeating: " ", count: n - s.count)
 }
@@ -887,24 +1108,78 @@ func lpad(_ s: String, _ n: Int) -> String {
 
 // MARK: - panel view
 
+struct AppRootView: View {
+    @ObservedObject var panel: PanelModel
+    @ObservedObject var manager: ModelManagerModel
+    @ObservedObject var navigation: AppNavigation
+
+    var body: some View {
+        Group {
+            switch navigation.screen {
+            case .models:
+                ModelManagerView(model: manager, panel: panel, navigation: navigation)
+            case .monitor:
+                PanelView(model: panel, navigation: navigation)
+            case .tools:
+                ToolsView(model: panel, navigation: navigation)
+            }
+        }
+        .onChange(of: panel.derived?.model) { _, name in
+            guard let name, name != "no model loaded", !navigation.hasChosenScreen else { return }
+            navigation.screen = .monitor
+        }
+    }
+}
+
+struct ScreenPicker: View {
+    @ObservedObject var navigation: AppNavigation
+
+    var body: some View {
+        Picker("Section", selection: Binding(
+            get: { navigation.screen },
+            set: { navigation.show($0) }
+        )) {
+            Text("Models").tag(AppNavigation.Screen.models)
+            Text("Monitor").tag(AppNavigation.Screen.monitor)
+            Text("Tools").tag(AppNavigation.Screen.tools)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .frame(width: 230)
+        .accessibilityLabel("Application section")
+    }
+}
+
 struct PanelView: View {
     @ObservedObject var model: PanelModel
+    @ObservedObject var navigation: AppNavigation
 
     var body: some View {
         ZStack {
             VisualEffectBackground()
             Color.black.opacity(0.55)
             if model.derived != nil, !model.offline {
-                PanelContent(model: model)
-                    .padding(14)
+                VStack(spacing: 0) {
+                    MonitorHeader(model: model, navigation: navigation)
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            PanelContent(model: model, navigation: navigation,
+                                         showLogs: {
+                                             model.showLogs = true
+                                             proxy.scrollTo("monitor-logs", anchor: .bottom)
+                                         })
+                                .padding(14)
+                        }
+                    }
+                }
             } else {
-                OfflineView(model: model)
+                OfflineView(model: model, navigation: navigation)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .contextMenu {
-            Button("Quit MLXStack") {
+            Button("Quit MLX Stack") {
                 NSApplication.shared.terminate(nil)
             }
             .keyboardShortcut("q", modifiers: .command)
@@ -912,41 +1187,232 @@ struct PanelView: View {
     }
 }
 
+struct MonitorHeader: View {
+    @ObservedObject var model: PanelModel
+    @ObservedObject var navigation: AppNavigation
+    private var d: Derived { model.derived! }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                ScreenPicker(navigation: navigation)
+                Spacer()
+                Text("uptime \(d.uptime)")
+                    .font(mono(11))
+                    .foregroundStyle(C.dim)
+            }
+            HStack(spacing: 18) {
+                ModelIdentity(role: "Main", name: d.model, active: d.model != "no model loaded",
+                              activity: model.selectedModel == .main ? activityState : nil)
+                ModelIdentity(role: "Small", name: d.smallModel ?? "not loaded",
+                              active: d.smallModel != nil,
+                              activity: model.selectedModel == .small ? activityState : nil)
+            }
+            HStack(spacing: 12) {
+                ForEach(Array(d.chips.enumerated()), id: \.offset) { _, chip in
+                    ServiceStatusChip(chip: chip)
+                }
+                Spacer()
+                Text("User traffic only")
+                    .font(mono(10))
+                    .foregroundStyle(C.dim)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.black.opacity(0.20))
+    }
+    private var selectedTok: TokCol {
+        model.selectedModel == .small ? (d.tokSmall ?? d.tokMain) : d.tokMain
+    }
+
+    private var selectedActive: Int {
+        model.selectedModel == .small ? (d.activeRequestsSmall ?? 0) : (d.activeRequests ?? 0)
+    }
+
+    private var activityState: ActivityState {
+        if d.model == "no model loaded" && d.smallModel == nil { return .noModel }
+        if selectedActive > 0 { return .active }
+        if selectedTok.cur > 0 && selectedTok.txt.contains("prefill") { return .prefilling }
+        if selectedTok.cur > 0 { return .generating }
+        return .idle
+    }
+}
+
+
+private struct ModelIdentity: View {
+    let role: String
+    let name: String
+    let active: Bool
+    let activity: ActivityState?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(role).foregroundStyle(C.dim)
+                if let activity {
+                    ActivityBadge(state: activity)
+                }
+            }
+            Text(name)
+                .foregroundStyle(active ? C.fg : C.dim)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+        }
+        .font(mono(11))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private enum ActivityState {
+    case idle, generating, prefilling, active, noModel
+
+    var title: String {
+        switch self {
+        case .idle: return "Idle"
+        case .generating: return "Generating"
+        case .prefilling: return "Prefilling"
+        case .active: return "Active requests"
+        case .noModel: return "No model"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .idle: return "checkmark.circle"
+        case .generating: return "waveform.path.ecg"
+        case .prefilling: return "hourglass"
+        case .active: return "arrow.triangle.2.circlepath"
+        case .noModel: return "circle.dashed"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .idle: return C.dim
+        case .generating: return C.green
+        case .prefilling: return C.yellow
+        case .active: return C.cyan
+        case .noModel: return C.dim
+        }
+    }
+}
+
+private struct ActivityBadge: View {
+    let state: ActivityState
+
+    var body: some View {
+        Label(state.title, systemImage: state.icon)
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(state.color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(state.color.opacity(0.10), in: RoundedRectangle(cornerRadius: 5))
+            .accessibilityLabel("Main model \(state.title.lowercased())")
+    }
+}
+
+private struct ServiceStatusChip: View {
+    let chip: Chip
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: chip.up ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .accessibilityHidden(true)
+            Text("\(chip.service) :\(chip.port)")
+        }
+        .font(.system(size: 11, weight: .medium))
+        .foregroundStyle(chip.up ? C.green : C.red)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(chip.service) \(chip.up ? "running" : "stopped") on port \(chip.port)")
+    }
+}
+
+struct LogRowsView: View {
+    let rows: [Row]
+    let followsTail: Bool
+
+    var body: some View {
+        VStack(spacing: 2) {
+            HStack {
+                Spacer()
+                Button("Copy all logs") {
+                    copyText(rows.map(\.text).joined(separator: "\n"))
+                }
+                .controlSize(.small)
+            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                            Text(row.text)
+                                .font(mono(11))
+                                .foregroundStyle(row.color)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .textSelection(.enabled)
+                                .contextMenu {
+                                    Button("Copy log line") { copyText(row.text) }
+                                    Button("Copy all logs") {
+                                        copyText(rows.map(\.text).joined(separator: "\n"))
+                                    }
+                                }
+                        }
+                        Color.clear.frame(height: 1).id("log-bottom")
+                    }
+                    .padding(.vertical, 2)
+                }
+                .onAppear { proxy.scrollTo("log-bottom", anchor: .bottom) }
+                .onChange(of: rows.count) {
+                    if followsTail { proxy.scrollTo("log-bottom", anchor: .bottom) }
+                }
+            }
+        }
+    }
+}
+
 struct OfflineView: View {
     @ObservedObject var model: PanelModel
+    @ObservedObject var navigation: AppNavigation
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(" MLX Stack")
-                .font(mono(15, .bold))
-                .foregroundStyle(C.cyan)
-            Spacer()
             HStack {
+                ScreenPicker(navigation: navigation)
                 Spacer()
-                VStack(spacing: 10) {
-                    if model.everConnected {
-                        Text("offline — cannot reach 127.0.0.1:\(model.port)")
-                            .font(mono(14, .semibold))
-                            .foregroundStyle(C.red)
-                        Text("retrying every second · graphs resume on reconnect")
-                            .font(mono(12))
-                            .foregroundStyle(C.dim)
-                    } else {
-                        Text("starting the built-in backend on 127.0.0.1:\(model.port)")
-                            .font(mono(14, .semibold))
-                            .foregroundStyle(C.fg)
-                        Text("first launch prepares Python dependencies automatically")
-                            .font(mono(12))
-                            .foregroundStyle(C.dim)
-                        Text("logs: ~/.ollmlx/logs/mlx-stack.log")
-                            .font(mono(11))
-                            .foregroundStyle(C.dim)
-                    }
-                }
-                Spacer()
+                Text("Monitor")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(C.fg)
             }
             Spacer()
-            Text(" ⌘Q — quit · right-click — menu · snapshot 127.0.0.1:\(model.port)/snapshot")
+            VStack(spacing: 12) {
+                Text(model.everConnected ? "Monitor is offline" : "Starting the local backend…")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(C.fg)
+                Text(model.everConnected
+                     ? "MLX Stack will reconnect automatically. Your models and settings are unchanged."
+                     : "The first launch prepares Python dependencies. This can take a few minutes.")
+                    .font(.callout)
+                    .foregroundStyle(C.dim)
+                    .multilineTextAlignment(.center)
+                ProgressView()
+                HStack {
+                    Button("Open Models") { navigation.show(.models) }
+                    Button("Show Log in Finder") {
+                        let log = FileManager.default.homeDirectoryForCurrentUser
+                            .appendingPathComponent(".mlx-stack/logs/mlx-stack.log")
+                        NSWorkspace.shared.activateFileViewerSelecting([log])
+                    }
+                }
+            }
+            .padding(24)
+            .frame(maxWidth: .infinity)
+            .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+            Spacer()
+            Text("⌘1 Models · ⌘2 Monitor · ⌘3 Tools · ⌘Q Quit")
                 .font(mono(11))
                 .foregroundStyle(C.dim)
                 .lineLimit(1)
@@ -957,199 +1423,365 @@ struct OfflineView: View {
 
 struct PanelContent: View {
     @ObservedObject var model: PanelModel
+    @ObservedObject var navigation: AppNavigation
+    let showLogs: () -> Void
     private var d: Derived { model.derived! }
-    private var port: Int { model.port }
+
+    private var hasMain: Bool { d.model != "no model loaded" }
+    private var hasSmall: Bool { d.smallModel != nil }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            VStack(alignment: .leading, spacing: 7) {
-                Text(" MLX Stack — \(d.model)")
-                    .font(mono(15, .bold))
-                    .foregroundStyle(C.cyan)
-                    .lineLimit(1)
-                headerLine
+        VStack(alignment: .leading, spacing: 14) {
+            notices
+            if !hasMain && !hasSmall {
+                emptyGeneration
+            } else {
+                performanceSummary
+                mainCharts
+                systemResources
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            MonitorDisclosure(title: "Logs", isExpanded: $model.showLogs) {
+                LogRowsView(rows: d.logRows, followsTail: false)
+                    .frame(height: 180)
+            }
+            .id("monitor-logs")
+            Text("⌘1 Models · ⌘2 Monitor · ⌘3 Tools · ⌘Q Quit")
+                .font(mono(11))
+                .foregroundStyle(C.dim)
+                .lineLimit(1)
+        }
+    }
 
-            HStack(alignment: .top, spacing: 10) {
-                tokColumn(d.tokMain)
-                if let s = d.tokSmall {
-                    tokColumn(s)
+    @ViewBuilder private var notices: some View {
+        if let error = model.loadError {
+            MonitorNotice(text: "Model launch failed (status \(error.status)). Review the logs before retrying.",
+                          actionTitle: "Review logs", action: showLogs)
+        }
+        if d.errorCount > 0 {
+            MonitorNotice(text: "\(d.errorCount) recent backend errors need attention.",
+                          actionTitle: "Review logs", action: showLogs)
+        }
+    }
+
+    private var emptyGeneration: some View {
+        Box(" Generation ") {
+            VStack(spacing: 8) {
+                Text("No model is active")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(C.fg)
+                Text("Load a model to see generation speed, request activity and context.")
+                    .font(.callout)
+                    .foregroundStyle(C.dim)
+                Button("Choose a model") { navigation.show(.models) }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 18)
+        }
+    }
+
+    private var showingSmall: Bool { model.selectedModel == .small && hasSmall }
+    private var selectedTok: TokCol { showingSmall ? (d.tokSmall ?? d.tokMain) : d.tokMain }
+    private var selectedRequests: RequestCol { showingSmall ? (d.requestsSmall ?? d.requestsMain) : d.requestsMain }
+    private var selectedCtx: CtxCol { showingSmall ? (d.ctxSmall ?? d.ctx) : d.ctx }
+    private var selectedActive: Int { showingSmall ? (d.activeRequestsSmall ?? 0) : (d.activeRequests ?? 0) }
+    private var selectedActivity: ActivityCol { showingSmall ? (d.activitySmall ?? d.activityMain) : d.activityMain }
+
+    private var performanceSummary: some View {
+        let contextValue = selectedCtx.barSuffix.replacingOccurrences(of: "] ", with: "")
+        let contextDetail = selectedCtx.footer
+        return HStack(alignment: .top, spacing: 0) {
+            PerformanceSummaryItem(
+                title: showingSmall ? "Small model" : "Real output",
+                value: selectedTok.cur > 0 ? String(format: "%.1f", selectedTok.cur) : "idle",
+                detail: selectedTok.cur > 0
+                    ? selectedTok.txt.trimmingCharacters(in: .whitespaces)
+                    : "waiting for a request",
+                footer: selectedTok.avg.map {
+                    String(format: "avg %.0f · peak %.0f tok/s while generating", $0, selectedTok.peak)
+                } ?? "no generation yet",
+                valueColor: selectedTok.cur > 0 ? C.fg : C.dim)
+            Rectangle().fill(C.dim.opacity(0.25)).frame(width: 1, height: 64)
+            PerformanceSummaryItem(
+                title: "Requests",
+                value: "\(selectedRequests.total)",
+                detail: selectedRequests.total > 0
+                    ? String(format: "%.1f per minute · %d active", selectedRequests.perMinute, selectedActive)
+                    : "none since load · \(selectedActive) active",
+                footer: requestActivity(selectedRequests))
+            Rectangle().fill(C.dim.opacity(0.25)).frame(width: 1, height: 64)
+            PerformanceSummaryItem(
+                title: "Context",
+                value: contextValue,
+                detail: contextDetail,
+                footer: showingSmall ? "Small model context" : "Context window and request latency")
+            Rectangle().fill(C.dim.opacity(0.25)).frame(width: 1, height: 64)
+            PerformanceSummaryItem(
+                title: "Memory",
+                value: String(format: "%.0f%%", d.memFrac * 100),
+                detail: d.memoryDetail,
+                footer: d.swapSuffix.map { "Swap \($0.replacingOccurrences(of: "] ", with: ""))" }
+                    ?? "Swap not reported",
+                valueColor: d.memLow ? C.red : C.fg)
+        }
+        .padding(10)
+        .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func requestActivity(_ requests: RequestCol) -> String {
+        let last = requests.lastAgo.map { String(format: "Last %.0fs ago", $0) }
+            ?? "No real requests yet"
+        let average = requests.averageInterval.map { "avg every \(durationText($0))" }
+            ?? "avg interval pending"
+        return last + " · " + average
+    }
+
+    private var contextHistorySummary: String {
+        let values = selectedCtx.samples.filter { $0 >= 0 }
+        guard !values.isEmpty else { return "No context history yet" }
+        let low = values.min() ?? 0
+        let high = values.max() ?? 0
+        if high - low <= max(1, selectedCtx.scale * 0.01) {
+            return "Stable at \(tokens(selectedCtx.current)) · auto 0–\(tokens(Int(selectedCtx.scale))) · cap \(tokens(Int(selectedCtx.capacity)))"
+        }
+        return "Range \(tokens(Int(low)))–\(tokens(Int(high))) · auto 0–\(tokens(Int(selectedCtx.scale))) · cap \(tokens(Int(selectedCtx.capacity)))"
+    }
+
+    private var modelSelector: some View {
+        HStack {
+            Text("Performance")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(C.fg)
+            Spacer()
+            Picker("Model", selection: $model.selectedModel) {
+                if hasMain {
+                    Text("Main").tag(MonitorModel.main)
                 }
-                ctxColumn(d.ctx)
+                if hasSmall {
+                    Text("Small").tag(MonitorModel.small)
+                }
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 140)
+        }
+        .onAppear {
+            if !hasMain && hasSmall { model.selectedModel = .small }
+        }
+    }
 
-            HStack(alignment: .top, spacing: 10) {
-                VStack(alignment: .leading, spacing: 6) {
-                    TermBar(label: " CPU [", frac: d.cpuTotal / 100, suffix: d.cpuSuffix)
-                    Box(" CPU history ") {
-                        GraphView(samples: d.cpuHist, scale: 100, colored: { heat($0) })
-                            .frame(height: 70)
+    private var mainCharts: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            modelSelector
+            HStack(alignment: .top, spacing: 12) {
+                Box(" Generation ") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        RateChart(samples: selectedTok.samples, scale: selectedTok.scale,
+                                  colored: { _ in C.green },
+                                  summary: selectedTok.txt)
+                            .frame(maxHeight: .infinity)
+                        ActivityBand(activity: selectedActivity.samples,
+                                     requests: selectedRequests.samples,
+                                     summary: activityCaption)
+                        TimeAxis()
+                        Text(activityCaption)
+                            .font(mono(10))
+                            .foregroundStyle(C.dim)
+                            .lineLimit(1)
+                        Text(selectedTok.footer)
+                            .font(mono(10))
+                            .foregroundStyle(C.dim)
+                            .lineLimit(2)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                Box(" cores ") {
-                    coresGrid
+                .frame(maxHeight: .infinity, alignment: .top)
+                Box(" Context usage ") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        TermBar(label: " Used ", frac: selectedCtx.barFrac, suffix: selectedCtx.barSuffix)
+                        RateChart(samples: selectedCtx.samples, scale: selectedCtx.scale,
+                                  colored: { heat(100 * $0 / max(selectedCtx.capacity, 1)) },
+                                  tickLabel: { tokens(Int($0)) },
+                                  summary: selectedCtx.barSuffix.replacingOccurrences(of: "] ", with: ""))
+                            .frame(maxHeight: .infinity)
+                        TimeAxis()
+                        Text(contextHistorySummary)
+                            .font(mono(10))
+                            .foregroundStyle(C.dim)
+                            .lineLimit(1)
+                        Text(selectedCtx.footer)
+                            .font(mono(10))
+                            .foregroundStyle(C.dim)
+                            .lineLimit(2)
+                    }
                 }
+                .frame(maxHeight: .infinity, alignment: .top)
             }
+            .frame(height: 240)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
 
-            HStack(alignment: .top, spacing: 10) {
-                Box(" clients ") {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(Array(d.clients.enumerated()), id: \.offset) { _, c in
-                            Button {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(c.command, forType: .string)
-                            } label: {
-                                Text(rpad(c.name, 6) + "  " + c.command)
-                                    .font(mono(12, .medium))
-                                    .foregroundStyle(C.fg)
+    /// The chart's main message in words (HIG): where the model's time went.
+    private var activityCaption: String {
+        let activity = selectedActivity
+        guard !activity.samples.isEmpty else { return "No history yet" }
+        let seconds = activity.samples.count
+        let window = seconds >= 120 ? String(format: "%.0f min", Double(seconds) / 60)
+            : seconds >= 60 ? "1 min" : "\(seconds) s"
+        let count = Int(selectedRequests.samples.reduce(0, +))
+        return "generating \(percent(activity.generating)) · reading prompt \(percent(activity.reading))"
+            + " · waiting for client \(percent(activity.waiting))"
+            + " · \(count) request\(count == 1 ? "" : "s") in \(window)"
+    }
+
+    private var systemResources: some View {
+        Box(" System resources ") {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 7) {
+                    TermBar(label: " CPU ", frac: d.cpuTotal / 100, suffix: d.cpuSuffix)
+                    RateChart(samples: d.cpuHist, scale: 100, colored: { heat($0) },
+                              tickLabel: { $0 > 0 ? "\(Int($0))%" : "0" },
+                              summary: "CPU use over the last four minutes")
+                        .frame(height: 48)
+                    Text("Last 4 minutes · \(d.coreCount) cores")
+                        .font(mono(10))
+                        .foregroundStyle(C.dim)
+                    MonitorDisclosure(title: "CPU cores", isExpanded: $model.showCPUCores) {
+                        coresGrid
+                    }
+                }
+                Rectangle().fill(C.dim.opacity(0.25)).frame(width: 1)
+                VStack(alignment: .leading, spacing: 7) {
+                    TermBar(label: " RAM ", frac: d.memFrac, suffix: d.memSuffix,
+                            fill: d.memLow ? C.red : nil,
+                            suffixColor: d.memLow ? C.red : C.fg)
+                    if let swSuffix = d.swapSuffix {
+                        TermBar(label: " SWP ", frac: d.swapFrac ?? 0, suffix: swSuffix)
+                    }
+                    if let tm = d.topMem {
+                        Text(tm.text)
+                            .font(mono(10))
+                            .foregroundStyle(tm.color)
+                            .lineLimit(2)
+                    }
+                    MonitorDisclosure(title: "Processes", isExpanded: $model.showProcesses) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(Array(d.procRows.enumerated()), id: \.offset) { _, row in
+                                Text(row.text)
+                                    .font(mono(10))
+                                    .foregroundStyle(row.color)
                                     .lineLimit(1)
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(c.command)
-                            .help("Click to copy command")
-                            .contextMenu {
-                                Button("Copy command") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(c.command, forType: .string)
-                                }
-                            }
-                        }
-                    }
-                }
-                Box(" processes ") {
-                    VStack(alignment: .leading, spacing: 3) {
-                        ForEach(Array(d.procRows.enumerated()), id: \.offset) { _, r in
-                            Text(r.text)
-                                .font(mono(11.5))
-                                .foregroundStyle(r.color)
-                                .lineLimit(1)
                         }
                     }
                 }
             }
-
-            TermBar(label: " MEM [", frac: d.memFrac, suffix: d.memSuffix,
-                    fill: d.memLow ? C.red : nil,
-                    suffixColor: d.memLow ? C.red : C.fg)
-            if d.swapFrac != nil, let swSuffix = d.swapSuffix {
-                TermBar(label: " SWP [", frac: d.swapFrac ?? 0, suffix: swSuffix)
-            }
-            if let tm = d.topMem {
-                Text(tm.text)
-                    .font(mono(11.5))
-                    .foregroundStyle(tm.color)
-                    .lineLimit(1)
-            }
-
-            Box(model.logOffset > 0 ? " logs · \(model.logOffset) from live " : " logs ") {
-                GeometryReader { g in
-                    let visible = max(1, Int(g.size.height / 13))
-                    let maxOffset = max(0, d.logRows.count - visible)
-                    let offset = min(model.logOffset, maxOffset)
-                    let end = d.logRows.count - offset
-                    let start = max(0, end - visible)
-                    VStack(alignment: .leading, spacing: 1) {
-                        ForEach(Array(d.logRows[start..<end].enumerated()), id: \.offset) { _, r in
-                            Text(r.text)
-                                .font(mono(11))
-                                .foregroundStyle(r.color)
-                                .lineLimit(1)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity,
-                           alignment: .bottomLeading)
-                    .overlay(ScrollWheelTarget { delta in
-                        model.scrollRemainder += delta
-                        let steps = Int(model.scrollRemainder / 12)
-                        if steps != 0 {
-                            model.logOffset = max(0, min(maxOffset, model.logOffset + steps))
-                            model.scrollRemainder -= Double(steps) * 12
-                        }
-                    })
-                }
-            }
-            .frame(maxHeight: .infinity, alignment: .bottom)
-
-            Text(" ⌘Q — quit · scroll — logs · right-click — menu · snapshot 127.0.0.1:\(port)/snapshot")
-                .font(mono(11))
-                .foregroundStyle(C.dim)
-                .lineLimit(1)
         }
-    }
-
-    private var headerLine: some View {
-        var s = AttributedString("uptime \(d.uptime)   ")
-        s.foregroundColor = C.fg
-        for chip in d.chips {
-            var t = AttributedString(chip.text + "   ")
-            t.foregroundColor = chip.up ? C.green : C.red
-            s.append(t)
-        }
-        var tail = AttributedString("cores \(d.coreCount)")
-        tail.foregroundColor = C.fg
-        s.append(tail)
-        return Text(s)
-            .font(mono(12))
-            .lineLimit(1)
-    }
-
-    private func tokColumn(_ t: TokCol) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            TermBar(label: " \(t.title) [", frac: t.barFrac, suffix: t.barSuffix,
-                    fill: C.green)
-            Box(t.boxTitle) {
-                GraphView(samples: t.samples, scale: t.scale, colored: { _ in C.green })
-                    .frame(height: 96)
-            }
-            Text(t.footer)
-                .font(mono(11))
-                .foregroundStyle(C.dim)
-                .lineLimit(1)
-                .padding(.horizontal, 2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func ctxColumn(_ t: CtxCol) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            TermBar(label: " CONTEXT [", frac: t.barFrac, suffix: t.barSuffix)
-            Box(" context history ") {
-                GraphView(samples: t.samples, scale: t.scale,
-                          colored: { heat(100 * $0 / max(t.scale, 1)) })
-                    .frame(height: 96)
-            }
-            Text(t.footer)
-                .font(mono(11))
-                .foregroundStyle(C.dim)
-                .lineLimit(1)
-                .padding(.horizontal, 2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var coresGrid: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)],
-                  alignment: .leading, spacing: 5) {
-            ForEach(Array(d.cores.enumerated()), id: \.offset) { i, v in
-                HStack(spacing: 6) {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 105, maximum: 140), spacing: 10)],
+                  alignment: .leading, spacing: 7) {
+            ForEach(Array(d.cores.enumerated()), id: \.offset) { i, value in
+                HStack(spacing: 5) {
                     Text(String(format: "C%02d", i))
-                        .foregroundStyle(heat(v))
-                    MiniBar(frac: v / 100)
-                        .frame(width: 36, height: 9)
-                    Text(String(format: "%3.0f%%", v))
-                        .foregroundStyle(heat(v))
+                        .foregroundStyle(heat(value))
+                        .frame(width: 24, alignment: .leading)
+                    MiniBar(frac: value / 100)
+                        .frame(width: 28, height: 6)
+                    Text(String(format: "%3.0f%%", value))
+                        .foregroundStyle(heat(value))
+                        .frame(width: 32, alignment: .trailing)
                 }
-                .font(mono(12))
+                .font(mono(10))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("CPU core \(i)")
+                .accessibilityValue(String(format: "%.0f percent", value))
             }
         }
+}
+}
+
+private struct MonitorNotice: View {
+    let text: String
+    let actionTitle: String
+    let action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(C.red)
+                .accessibilityHidden(true)
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(C.fg)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(actionTitle, action: action)
+        }
+        .padding(10)
+        .background(C.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+
+private struct PerformanceSummaryItem: View {
+    let title: String
+    let value: String
+    let detail: String
+    let footer: String
+    var valueColor: Color = C.fg
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.callout)
+                .foregroundStyle(C.dim)
+            Text(value)
+                .font(mono(20, .semibold))
+                .foregroundStyle(valueColor)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(detail)
+                .font(mono(10))
+                .foregroundStyle(C.fg)
+                .lineLimit(2)
+            Text(footer)
+                .font(mono(9))
+                .foregroundStyle(C.dim)
+                .lineLimit(2)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+
+private struct MonitorDisclosure<Content: View>: View {
+    let title: String
+    @Binding var isExpanded: Bool
+    let content: Content
+
+    init(title: String, isExpanded: Binding<Bool>, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self._isExpanded = isExpanded
+        self.content = content()
+    }
+
+    var body: some View {
+        DisclosureGroup(title, isExpanded: $isExpanded) {
+            content
+                .padding(.top, 7)
+        }
+        .font(.callout)
     }
 }
 
 // MARK: - terminal primitives
 
-/// label[■■■■□□□□] suffix — the put_bar() of the curses UI.
+/// label[■■■■■□□□□] suffix.
 struct TermBar: View {
     let label: String
     let frac: Double
@@ -1177,6 +1809,10 @@ struct TermBar: View {
                 .lineLimit(1)
         }
         .fixedSize(horizontal: false, vertical: true)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label.replacingOccurrences(of: "[", with: "")
+            .trimmingCharacters(in: .whitespaces))
+        .accessibilityValue(suffix.replacingOccurrences(of: "] ", with: ""))
     }
 }
 
@@ -1192,33 +1828,142 @@ struct MiniBar: View {
                     .frame(width: max(0, min(1, frac)) * g.size.width)
             }
         }
+        .accessibilityHidden(true)
     }
 }
 
-/// Column sparkline: one bar per sample, newest on the right.
-struct GraphView: View {
+// MARK: - history charts
+
+// Every history is a ring of `historySeconds` one-second samples, and every
+// chart maps time the same way: one slot per second with "now" at the right
+// edge, so a short history grows in from the right instead of sliding along.
+
+enum ChartAxis {
+    /// Width of the value-axis gutter on the leading edge of every chart.
+    static let gutter: CGFloat = 40
+}
+
+/// A time series as a line with a soft fill and a three-tick value axis.
+struct RateChart: View {
     let samples: [Double]
     let scale: Double
     let colored: (Double) -> Color
+    var tickLabel: (Double) -> String = { String(format: "%.0f", $0) }
+    var summary: String = "Rate over the last four minutes"
 
     var body: some View {
         Canvas { ctx, size in
+            let plot = CGRect(x: ChartAxis.gutter, y: 7,
+                              width: size.width - ChartAxis.gutter, height: size.height - 10)
+            guard plot.width > 0, plot.height > 0 else { return }
+            for fraction in [0.0, 0.5, 1.0] {
+                let y = plot.maxY - plot.height * CGFloat(fraction)
+                var grid = Path()
+                grid.move(to: CGPoint(x: plot.minX, y: y))
+                grid.addLine(to: CGPoint(x: plot.maxX, y: y))
+                ctx.stroke(grid, with: .color(C.dim.opacity(fraction == 0 ? 0.3 : 0.12)),
+                           lineWidth: 1)
+                ctx.draw(Text(tickLabel(scale * fraction)).font(mono(9)).foregroundColor(C.dim),
+                         at: CGPoint(x: plot.minX - 7, y: y), anchor: .trailing)
+            }
             let n = samples.count
             guard n > 0, scale > 0 else { return }
-            let cw = size.width / CGFloat(n)
-            for (i, v) in samples.enumerated() {
-                let f = CGFloat(max(0, min(1, v / scale)))
-                guard f > 0 else { continue }
-                let h = f * size.height
-                let rect = CGRect(x: CGFloat(i) * cw, y: size.height - h,
-                                  width: max(0.5, cw - 0.6), height: h)
-                ctx.fill(Path(rect), with: .color(colored(v)))
+            let step = plot.width / CGFloat(historySeconds)
+            func point(_ i: Int) -> CGPoint {
+                CGPoint(x: plot.maxX - CGFloat(n - 1 - i) * step - step / 2,
+                        y: plot.maxY - CGFloat(max(0, min(1, samples[i] / scale))) * plot.height)
+            }
+            var previous = point(0)
+            if n == 1 {
+                ctx.fill(Path(ellipseIn: CGRect(x: previous.x - 2, y: previous.y - 2,
+                                                width: 4, height: 4)),
+                         with: .color(colored(samples[0])))
+            }
+            for i in 1..<n {
+                let current = point(i)
+                let color = colored(samples[i])
+                var area = Path()
+                area.move(to: previous)
+                area.addLine(to: current)
+                area.addLine(to: CGPoint(x: current.x, y: plot.maxY))
+                area.addLine(to: CGPoint(x: previous.x, y: plot.maxY))
+                area.closeSubpath()
+                ctx.fill(area, with: .color(color.opacity(0.12)))
+                // a flat run of zeros is an idle gap: leave it to the axis
+                if samples[i] > 0 || samples[i - 1] > 0 {
+                    var line = Path()
+                    line.move(to: previous)
+                    line.addLine(to: current)
+                    ctx.stroke(line, with: .color(color),
+                               style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                }
+                previous = current
+            }
+            if samples[n - 1] > 0 {
+                let dot = CGRect(x: previous.x - 2.5, y: previous.y - 2.5, width: 5, height: 5)
+                ctx.fill(Path(ellipseIn: dot), with: .color(colored(samples[n - 1])))
             }
         }
+        .accessibilityLabel("History")
+        .accessibilityValue(summary)
     }
 }
 
-/// Bordered box with a title chip, like the curses ┌ logs ┐ frames.
+/// Time labels under a history chart: four minutes, "now" at the right edge.
+struct TimeAxis: View {
+    var body: some View {
+        HStack(spacing: 0) {
+            Color.clear.frame(width: ChartAxis.gutter, height: 1)
+            HStack {
+                Text("4 min ago")
+                Spacer()
+                Text("2 min ago")
+                Spacer()
+                Text("now")
+            }
+        }
+        .font(mono(9))
+        .foregroundStyle(C.dim)
+        .frame(height: 11)
+        .accessibilityHidden(true)
+    }
+}
+
+/// What the model did each second: generating (full height), reading a
+/// prompt (a lower band) or waiting for the client (the empty track), with
+/// a tick for every second in which a request arrived.
+struct ActivityBand: View {
+    let activity: [Double]
+    let requests: [Double]
+    var summary: String = "Model activity over the last four minutes"
+
+    var body: some View {
+        Canvas { ctx, size in
+            let n = activity.count
+            guard n > 0 else { return }
+            let step = (size.width - ChartAxis.gutter) / CGFloat(historySeconds)
+            let origin = size.width - CGFloat(n) * step
+            ctx.fill(Path(CGRect(x: ChartAxis.gutter, y: 0, width: size.width - ChartAxis.gutter,
+                                 height: size.height)), with: .color(C.barBg.opacity(0.6)))
+            for (i, state) in activity.enumerated() where state != Activity.idle {
+                let height = state == Activity.decode ? size.height : size.height * 0.55
+                let rect = CGRect(x: origin + CGFloat(i) * step, y: size.height - height,
+                                  width: step + 0.5, height: height)
+                ctx.fill(Path(rect), with: .color((state == Activity.decode ? C.green : C.yellow).opacity(0.9)))
+            }
+            for (i, count) in requests.enumerated() where count > 0 && i < n {
+                ctx.fill(Path(CGRect(x: origin + CGFloat(i) * step + step / 2 - 1, y: 0,
+                                     width: 2, height: 4)), with: .color(C.fg))
+            }
+        }
+        .frame(height: 14)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Model activity")
+        .accessibilityValue(summary)
+    }
+}
+
+/// Bordered box with a title chip.
 struct Box<Content: View>: View {
     private let title: String
     private let makeContent: () -> Content

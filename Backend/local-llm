@@ -15,7 +15,8 @@ while [ -L "$SELF" ]; do
 done
 APP_DIR=$(cd "$(dirname "$SELF")" && pwd -P)
 RESOURCES_DIR=$(CDPATH= cd -- "$APP_DIR/.." && pwd -P)
-OLLMLX="${OLLMLX_HOME:-$HOME/.ollmlx}"
+. "$APP_DIR/mlx-stack-home.sh"
+mlx_stack_home
 VENV="$OLLMLX/mlx-stack-venv"
 STAMP="$OLLMLX/mlx-stack-venv.deps"
 UV="$RESOURCES_DIR/bin/uv"
@@ -27,8 +28,7 @@ fi
   exit 1
 }
 
-# Model helpers also need uv and a previously installed litellm under Finder's
-# minimal LaunchServices environment.
+# Model helpers also need uv under Finder's minimal LaunchServices environment.
 PATH="$RESOURCES_DIR/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 

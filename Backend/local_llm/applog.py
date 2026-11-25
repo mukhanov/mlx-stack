@@ -1,4 +1,4 @@
-"""Persistent application log: ~/.ollmlx/logs/app.log (rotating).
+"""Persistent application log: ~/.mlx-stack/logs/app.log (rotating).
 
 The app used to leave nothing behind on a crash: its own exceptions went
 to the terminal (gone), and the server logs lived in /tmp (wiped by
@@ -16,23 +16,23 @@ import signal
 import sys
 import threading
 from pathlib import Path
-
 from . import __version__
+from .config import stack_home
+
 
 log = logging.getLogger("local-llm")
 
 
 def logs_dir() -> Path:
-    """~/.ollmlx/logs (OLLMLX_HOME-respecting), created on demand."""
-    d = (Path(os.environ.get("OLLMLX_HOME", "~/.ollmlx")).expanduser()
-         / "logs")
+    """~/.mlx-stack/logs, created on demand."""
+    d = stack_home() / "logs"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def _signal_shutdown(signum, _frame):
-    # die via an exception instead of vanishing: run_stack's finally then
-    # stops the children (a hard kill orphans them) and the exit is logged
+    # die via an exception instead of vanishing: cli.run_serve's finally
+    # then stops the children (a hard kill orphans them) and the exit is logged
     log.info("%s — shutting down", signal.Signals(signum).name)
     raise SystemExit(128 + signum)
 
@@ -72,8 +72,8 @@ def setup() -> Path | None:
         prev_thread_hook = threading.excepthook
 
         def _thread_hook(args):
-            # SystemExit is a worker's orderly bail-out (run_stack raises
-            # it on failure paths) — the interesting crashes are the rest
+            # SystemExit is a thread's orderly bail-out — the interesting
+            # crashes are the rest
             if args.exc_type not in (SystemExit, KeyboardInterrupt):
                 log.error("uncaught exception in thread %s",
                           args.thread.name,
@@ -91,5 +91,5 @@ def setup() -> Path | None:
     if path:
         log.info("local-llm %s · python %s · pid %d · args: %s",
                  __version__, sys.version.split()[0], os.getpid(),
-                 " ".join(sys.argv[1:]) or "(model picker)")
+                 " ".join(sys.argv[1:]) or "(no arguments)")
     return path

@@ -4,7 +4,7 @@ Launched instead of `python -m mlx_lm.server` (same CLI, same behavior —
 see servers.start_mlx). One hook: ResponseGenerator.generate is wrapped so
 that every generated token bumps an aggregate counter, and once a second a
 "TOKPS ..." line goes to stdout — servers.py redirects it to
-~/.ollmlx/logs/mlx-server.log, where monitor.py picks it up for its tok/s
+~/.mlx-stack/logs/mlx-server.log, where monitor.py picks it up for its tok/s
 graph.
 
 Line formats (kept short and stable — the monitor parses them):
@@ -168,14 +168,14 @@ def _tok_bump(now: float) -> None:
             st["tokens"], st["t0"] = 0, now
 
 
-def _prefill_cb(orig_cb):
+def _prefill_cb(orig_cb, enabled=True):
     """Wrap the handler's progress callback: emit prefill rate lines ~1/s."""
     state = {"last_p": 0, "t": time.monotonic(), "seq": 0}
 
     def cb(processed, total):
         now = time.monotonic()
         dt = now - state["t"]
-        if dt >= EMIT_EVERY and processed > state["last_p"]:
+        if enabled and dt >= EMIT_EVERY and processed > state["last_p"]:
             state["seq"] += 1
             _emit(f"prefill #{state['seq']} {(processed - state['last_p']) / dt:.0f}")
             state["last_p"], state["t"] = processed, now
@@ -185,23 +185,26 @@ def _prefill_cb(orig_cb):
     return cb
 
 
-def _counting(ctx, inner):
-    """Yield what `inner` yields, counting tokens and timing the phases."""
+def _counting(ctx, inner, internal=False):
+    """Yield what `inner` yields, counting real requests and timing phases."""
     n = 0
     t0 = time.monotonic()
     t_first = None
     prompt = getattr(ctx, "prompt", ()) or ()
     context_t = t0
-    _active_bump(1)
+    if not internal:
+        _active_bump(1)
     try:
         for resp in inner:
             if t_first is None:
                 t_first = time.monotonic()
             n += 1
             now = time.monotonic()
-            _tok_bump(now)
+            if not internal:
+                _tok_bump(now)
             if prompt and now - context_t >= EMIT_EVERY:
-                _emit(f"context {len(prompt) + n}")
+                if not internal:
+                    _emit(f"context {len(prompt) + n}")
                 context_t = now
             yield resp
     finally:
@@ -215,8 +218,9 @@ def _counting(ctx, inner):
             ttft = (t_first or t_end) - t0
             parts.append(f"prompt {len(prompt)} tok, {cached} cached"
                          f" ({ttft:.1f}s to first)")
-        _emit(" · ".join(parts))
-        _active_bump(-1)
+        if not internal:
+            _emit(" · ".join(parts))
+            _active_bump(-1)
 
 
 def _msg_text(content) -> str:
@@ -301,6 +305,17 @@ def _patch_arrays_cache() -> None:
     cache_mod.ArraysCache.state = property(state, set_state)
 
 
+def _internal_request(request, generation_args) -> bool:
+    """The stack's own readiness probes are not user traffic."""
+    messages = getattr(request, "messages", None) or []
+    if not messages or not isinstance(messages[-1], dict):
+        return False
+    text = _msg_text(messages[-1].get("content")).strip()
+    limit = getattr(generation_args, "max_tokens", None)
+    return ((limit == 1 and text == "ping")
+            or (limit == 8 and text == "Say OK"))
+
+
 def _install_hook() -> None:
     orig_generate = mlxs.ResponseGenerator.generate
     # KV budget for this machine (tokens); 0 = unlimited. Set by servers.
@@ -310,8 +325,9 @@ def _install_hook() -> None:
     max_input = int(os.environ.get("OLLMLX_MAX_INPUT_TOKENS", "0") or 0)
 
     def generate(self, request, generation_args, progress_callback=None):
-        ctx, inner = orig_generate(
-            self, request, generation_args, _prefill_cb(progress_callback))
+        internal = _internal_request(request, generation_args)
+        progress = _prefill_cb(progress_callback, enabled=not internal)
+        ctx, inner = orig_generate(self, request, generation_args, progress)
         n = len(getattr(ctx, "prompt", ()) or ())
         if max_input and n > max_input:
             # the session outgrew the machine's KV budget: shrink it here —
@@ -349,21 +365,20 @@ def _install_hook() -> None:
                     _emit(f"trim attempt: sending {len(trimmed)} of "
                           f"{orig_len} messages (dropped {dropped})")
                     ctx, inner = orig_generate(
-                        self, request, generation_args,
-                        _prefill_cb(progress_callback))
+                        self, request, generation_args, progress)
                     n = len(getattr(ctx, "prompt", ()) or ())
                     if n <= max_input:
                         _emit(f"context trimmed: dropped {dropped} oldest "
                               f"messages, {n} tokens fit the budget — "
                               "compact the client session")
-                        return ctx, _counting(ctx, inner)
+                        return ctx, _counting(ctx, inner, internal=internal)
                     target_chars = int(target_chars * 0.7)
                     _emit(f"context trim pass: still {n} tokens over "
                           f"{max_input} — shrinking further")
             raise ValueError(
                 f"context too long: {n} tokens > {max_input} (the KV budget"
                 " of this machine) — compact the session and retry")
-        return ctx, _counting(ctx, inner)
+        return ctx, _counting(ctx, inner, internal=internal)
 
     mlxs.ResponseGenerator.generate = generate
 

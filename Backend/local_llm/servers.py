@@ -1,15 +1,15 @@
-"""Lifecycle of mlx_lm.server (:19797, OpenAI) and litellm (:4000, OpenAI +
-Anthropic bridge): litellm config, start, readiness wait, warmup, stop,
-plus a watchdog that restarts mlx after a crash or the post-OOM zombie.
+"""Lifecycle of mlx_lm.server (:19797, OpenAI) and the client proxy (:4000,
+OpenAI + Anthropic bridge): start, readiness wait, warmup, stop, plus a
+watchdog that restarts mlx after a crash or the post-OOM zombie.
 
 The servers run as foreground children of our process (no nohup/daemons):
-exiting the monitor or Ctrl-C kills everything at once (see cli.run_stack ->
-finally)."""
+stopping the stack (SIGTERM, SIGHUP or Ctrl-C) kills everything at once
+(see cli.run_serve)."""
+import hashlib
 import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import threading
@@ -18,15 +18,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from . import hf, ui
+from . import hf, proxy, ui
 from .applog import log, logs_dir
 
 _LOGS = logs_dir()   # persistent: /tmp is wiped on reboot, taking the
-# evidence of a crash with it — ~/.ollmlx/logs survives
+# evidence of a crash with it — ~/.mlx-stack/logs survives
 MLX_LOG = str(_LOGS / "mlx-server.log")
 MLX_SMALL_LOG = str(_LOGS / "mlx-small.log")
 LLAMA_LOG = str(_LOGS / "llama-server.log")
-LITELLM_LOG = str(_LOGS / "litellm.log")
+PROXY_LOG = str(_LOGS / "proxy.log")
 WATCHDOG_LOG = str(_LOGS / "mlx-watchdog.log")
 
 # Popen handles of live children — killed in stop_children()
@@ -87,8 +87,6 @@ def stop_all(llama_port: int = 0) -> None:
     if llama_port:
         ui.ok("llama-server stopped" if _pkill(_llama_pattern(llama_port))
               else "llama-server not running")
-    ui.ok("litellm stopped" if _pkill(f"litellm --config")
-          else "litellm not running")
 
 
 def stop_children() -> None:
@@ -153,8 +151,8 @@ def supervise(cfg, model: str, state: dict, interval: float = 45.0,
               max_input: int | None = None) -> None:
     """Start the watchdog thread. `state` = {"big": Popen, "small": Popen|None,
     "backend": "mlx"|"llama", ...}; on a dead process or 2 consecutive bad
-    probes it restarts the model server(s) in place — litellm and the
-    client configs keep pointing at the same ports, so clients just see a
+    probes it restarts the model server(s) in place — the client proxy and
+    the client configs keep pointing at the same ports, so clients just see a
     pause.
 
     loop_max restarts within loop_window = the client session is bigger
@@ -235,22 +233,40 @@ def stop_watchdog() -> None:
     _watchdog_stop.set()
 
 
-def ensure_litellm() -> None:
-    # a Homebrew python upgrade orphans the uv-tool venv: the binary sits
-    # in PATH but its shebang points at a removed interpreter — verify it
-    # actually runs, not just that it exists.
-    exe = shutil.which("litellm")
-    if exe:
-        try:
-            if subprocess.run([exe, "--version"], capture_output=True,
-                              timeout=60).returncode == 0:
-                return
-        except (OSError, subprocess.SubprocessError):
-            pass
-        ui.warn("litellm found at %s but broken — reinstalling" % exe)
-    ui.info("Installing litellm (uv tool)")
-    subprocess.run(["uv", "tool", "install", "--force", "--python", "3.12",
-                    "litellm[proxy]"], check=True)
+_proxy_log = None
+_proxy_log_lock = threading.Lock()
+
+
+def start_proxy(cfg, model: str, small_ok: bool) -> None:
+    """The client proxy as a thread of this process (local_llm.proxy):
+    resolves the local/small aliases to the model servers, relays OpenAI
+    requests and bridges Anthropic /v1/messages. Started before the model
+    servers, so the port answers while they load and clients see a 503
+    instead of a refused connection."""
+    global _proxy_log
+    ui.info(f"Starting client proxy on :{cfg.proxy_port}")
+    _proxy_log = _open_log(PROXY_LOG)
+
+    def access(line: str) -> None:
+        with _proxy_log_lock:
+            _proxy_log.write((line + "\n").encode())
+            _proxy_log.flush()
+
+    try:
+        server = proxy.ProxyServer(
+            cfg.proxy_port,
+            proxy.build_routes(model, cfg.mlx_port, cfg.small_model,
+                               cfg.mlx_small_port if small_ok else 0),
+            cfg.api_key, cfg.client_timeout, access)
+    except OSError as exc:
+        raise SystemExit(
+            f"   cannot bind the client proxy to 127.0.0.1:{cfg.proxy_port}"
+            f" ({exc.strerror or exc}) — port busy (PROXY_PORT) or another"
+            " stack is still running") from None
+    threading.Thread(target=server.serve_forever, name="client-proxy",
+                     daemon=True).start()
+    log.info("client proxy: up (openai+anthropic on 127.0.0.1:%d, helper=%s)",
+             cfg.proxy_port, small_ok)
 
 
 def ensure_gsq_runtime(cfg) -> None:
@@ -325,8 +341,18 @@ def start_mlx(cfg, model: str, max_input: int | None = None) -> None:
         else:
             ui.warn("KV-cache quantization not supported by this "
                     "mlx_lm.server — running without it")
-    if cfg.prompt_cache_bytes > 0 and "--prompt-cache-bytes" in supported:
-        flags += ["--prompt-cache-bytes", str(cfg.prompt_cache_bytes)]
+    cache_bytes = min(cfg.prompt_cache_bytes,
+                      int(hf.memory_cache_limit(cfg.hf_hub, model) * 0.95))
+    if cache_bytes > 0 and "--prompt-cache-bytes" in supported:
+        flags += ["--prompt-cache-bytes", str(cache_bytes)]
+    for flag, env_name, default in (
+            ("--temp", "OLLMLX_TEMP", "0.0"),
+            ("--top-p", "OLLMLX_TOP_P", "1.0"),
+            ("--top-k", "OLLMLX_TOP_K", "0"),
+            ("--min-p", "OLLMLX_MIN_P", "0.0")):
+        if flag in supported:
+            flags += [flag, os.environ.get(env_name, default)]
+    max_tokens = int(os.environ.get("OLLMLX_MAX_TOKENS", str(min(ctx, 32768))))
     if "--prefill-step-size" in supported:
         # qwen3.5/3.8 MoE: a 2048-token chunk fans out to thousands of
         # expert buffers and hits the Metal resource limit (499000) —
@@ -349,7 +375,7 @@ def start_mlx(cfg, model: str, max_input: int | None = None) -> None:
     cmd = [python, "-m", "local_llm.mlxwrap",   # mlx_lm.server + tok/s log
            "--model", model, "--host", "127.0.0.1",
            "--port", str(cfg.mlx_port),
-           "--max-tokens", str(min(ctx, 32768)), *flags]
+           "--max-tokens", str(max_tokens), *flags]
     log.info("spawn: %s", shlex.join(cmd))
     try:
         proc = subprocess.Popen(cmd, stdout=logfile,
@@ -362,12 +388,32 @@ def start_mlx(cfg, model: str, max_input: int | None = None) -> None:
     return proc
 
 
+def _reasoning_template(cfg, gguf_path):
+    """Accept OpenAI's 'high' as 'xhigh' only for templates that already
+    understand both reasoning_effort and xhigh. Model names are irrelevant."""
+    from . import llamacpp
+    template = llamacpp.gguf_meta(gguf_path).get("tokenizer.chat_template")
+    if not isinstance(template, str) or not template:
+        return None
+    if "reasoning_effort" not in template or "xhigh" not in template:
+        return None
+    patched = ('{%- if reasoning_effort == "high" -%}'
+               '{%- set reasoning_effort = "xhigh" -%}'
+               '{%- endif -%}\n' + template)
+    digest = hashlib.sha256(patched.encode()).hexdigest()[:20]
+    path = cfg.ollmlx_home / "templates" / f"reasoning-{digest}.jinja"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() or path.read_text() != patched:
+        path.write_text(patched)
+    return path
+
+
 def start_llama(cfg, gguf_path: str, alias: str,
                 max_input: int | None = None,
                 lora_path: str | None = None):
     """llama-server (llama.cpp) in the mlx slot: GGUF weights on
-    cfg.mlx_port with the OpenAI API, so litellm/clients/monitor keep
-    working unchanged. Readiness = /v1/models 200, same as mlx."""
+    cfg.mlx_port with the OpenAI API, so the proxy, the clients and the
+    monitor keep working unchanged. Readiness = /v1/models 200, same as mlx."""
     from . import llamacpp
     server = llamacpp.ensure_llama_server(cfg.llama_server)
     ui.info(f"Starting llama-server on :{cfg.mlx_port}")
@@ -376,12 +422,20 @@ def start_llama(cfg, gguf_path: str, alias: str,
     flags = ["-m", gguf_path, "--host", "127.0.0.1",
              "--port", str(cfg.mlx_port),
              # the alias is what /v1/models reports — keep it the repo id
-             # so litellm's model: openai/<repo> lines up
+             # so it matches the model catalog
              "-a", alias, "-ngl", "999",
              # -c caps the KV allocation AND is the refusal ceiling: prompts
              # past it get a clean 400 instead of an OOM later (the same
              # job OLLMLX_MAX_INPUT_TOKENS does for mlxwrap)
-             "-c", str(max_input or 0)]
+             "-c", str(max_input or 0),
+             "--temp", os.environ.get("OLLMLX_TEMP", "0.0"),
+             "--top-p", os.environ.get("OLLMLX_TOP_P", "1.0"),
+             "--top-k", os.environ.get("OLLMLX_TOP_K", "0"),
+             "--min-p", os.environ.get("OLLMLX_MIN_P", "0.0"),
+             "--n-predict", os.environ.get("OLLMLX_MAX_TOKENS", "32768")]
+    template = _reasoning_template(cfg, gguf_path)
+    if template:
+        flags += ["--chat-template-file", str(template)]
     if lora_path:
         # The pi adapter was trained and evaluated with thinking disabled.
         flags += ["--lora", lora_path,
@@ -443,75 +497,15 @@ def start_mlx_small(cfg) -> None:
     return proc
 
 
-def _write_litellm_config(cfg, model: str, small: bool = True) -> None:
-    small_block = (f"""\
-  - model_name: "small"          # tiny helper: background calls / titles
-    litellm_params:
-      model: "openai/{cfg.small_model}"
-      api_base: "http://127.0.0.1:{cfg.mlx_small_port}/v1"
-      api_key: "none"
-      request_timeout: 120
-""" if small else "")
-    cfg.litellm_cfg.write_text(f"""\
-model_list:
-  - model_name: "{model}"
-    litellm_params:
-      model: "openai/{model}"
-      api_base: "http://127.0.0.1:{cfg.mlx_port}/v1"
-      api_key: "none"
-      request_timeout: {cfg.client_timeout}
-  - model_name: "local"          # slash-free alias: pi/omp send the bare catalog id to the API
-    litellm_params:
-      model: "openai/{model}"
-      api_base: "http://127.0.0.1:{cfg.mlx_port}/v1"
-      api_key: "none"
-      request_timeout: {cfg.client_timeout}
-{small_block}
-litellm_settings:
-  drop_params: true
-
-general:
-  master_key: "{cfg.api_key}"
-""")
-
-
-def start_litellm(cfg, model: str, small: bool = True) -> None:
-    health = f"http://127.0.0.1:{cfg.litellm_port}/health/liveliness"
-    if http_ok(health):
-        ui.ok(f"litellm already running on :{cfg.litellm_port}"
-              " (restarting for new config)")
-        _pkill(f"litellm --config")
-        time.sleep(2)
-    ui.info(f"Starting litellm on :{cfg.litellm_port}")
-    _write_litellm_config(cfg, model, small)
-    env = dict(os.environ)
-    # Anthropic bridge /v1/messages -> chat/completions (mlx has no /v1/responses)
-    # the proxy binds 127.0.0.1 with the static client key in the config;
-    # newer litellm refuses to boot without a strong master key
-    env["LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY"] = "true"
-    logfile = _open_log(LITELLM_LOG)
-    cmd = ["litellm", "--config", str(cfg.litellm_cfg),
-           "--host", "127.0.0.1", "--port", str(cfg.litellm_port)]
-    log.info("spawn: %s", shlex.join(cmd))
-    try:
-        proc = subprocess.Popen(cmd, stdout=logfile,
-                                stderr=subprocess.STDOUT, env=env)
-    finally:
-        logfile.close()
-    children.append(proc)
-    waited = _wait_ready(health, proc, 60, LITELLM_LOG, "litellm", step=1)
-    ui.ok(f"litellm ready ({waited}s)")
-
-
 def warmup(cfg) -> None:
-    """End-to-end warmup: litellm (via the `local` alias, like the clients) -> mlx.
+    """End-to-end warmup: the client proxy (via the `local` alias, like the
 
     Fatal on failure: /v1/models answers 200 before the weights are loaded,
     so this is the only real readiness gate — a stack that fails here would
-    only serve errors (cli's finally still stops the servers)."""
+    only serve errors (cli.run_serve still stops the servers)."""
     ui.info("Warmup request")
     req = urllib.request.Request(
-        f"http://127.0.0.1:{cfg.litellm_port}/v1/chat/completions",
+        f"http://127.0.0.1:{cfg.proxy_port}/v1/chat/completions",
         data=json.dumps({"model": "local", "max_tokens": 8,
                          "messages": [{"role": "user", "content": "Say OK"}]}
                         ).encode(),
@@ -528,7 +522,7 @@ def warmup(cfg) -> None:
                 "thread (Metal OOM -> 404s until restart) — free RAM/swap, "
                 "`local-llm stop`, retry; the previous run's log is "
                 f"{MLX_LOG}.1 / {LLAMA_LOG}.1")
-        for path in (MLX_LOG, LLAMA_LOG, LITELLM_LOG):
+        for path in (MLX_LOG, LLAMA_LOG, PROXY_LOG):
             lines = tail(path, 15)
             if lines:
                 print(f"--- last lines of {path} ---")

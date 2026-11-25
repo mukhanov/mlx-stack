@@ -177,6 +177,12 @@ def _rope_partial(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     return mx.concatenate([xr, xp], axis=-1) if xp.shape[-1] else xr
 
 
+def _l2norm(x: mx.array, eps: float = 1e-6) -> mx.array:
+    """Reference L2 norm: epsilon is added after the sum, not to the mean."""
+    xf = x.astype(mx.float32)
+    return (xf * mx.rsqrt((xf * xf).sum(-1, keepdims=True) + eps)).astype(x.dtype)
+
+
 class RotaryEmbedding:
     def __init__(self, dim: int, base: float):
         self.dim = dim
@@ -479,9 +485,7 @@ class GatedDeltaNet(nn.Module):
         k = k.reshape(B, S, self.n_k, self.dk)
         v = v.reshape(B, S, self.n_v, self.dv)
 
-        inv_scale = self.dk**-0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = _l2norm(q) * self.dk**-0.5, _l2norm(k)
 
         state = cache[1] if cache is not None else None
         out, state = gated_delta_update(
@@ -683,6 +687,8 @@ class NGramEmbedding(nn.Module):
         for ngram in range(2, self.ngram_size + 1):
             lo = (ngram - 2) * self.heads_per_ngram
             hi = lo + self.heads_per_ngram
+            # Match Qwen4ExpTextNGramEmbedding exactly: every n-gram starts
+            # again from the unigram, rather than extending the previous hash.
             mixed = shifted[0] * self._mults[0]
             for p in range(1, ngram):
                 mixed = mx.bitwise_xor(mixed, shifted[p] * self._mults[p])
@@ -1117,17 +1123,16 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         # Fold the reference's `1 +` into the weight here instead of at every call. Gated on
-        # the HF layout, because sanitize also runs on load: a checkpoint converted by this
-        # file comes back as `model.*`, matches nothing below, and must not be folded twice.
-        # Checkpoints from other MLX converters already carry the folded value.
-        fold = any(k.startswith("model.language_model.") for k in weights)
-        # oMLX oQ conversions also keep the reference's raw zero-centered norm
-        # weights (their runtime applies the 1+), but arrive in the flat
-        # `language_model.*` form like already-folded MLX conversions. Tell
-        # them apart by the oQ PLE weight_scale, which only oMLX writes.
-        if not fold:
-            fold = any(k.endswith(".ngram_embedding.weight_scale")
-                       for k in weights)
+        # the checkpoint layout so a checkpoint converted by this file (`model.*`) is not
+        # folded twice. HF and mlx-vlm/REAP checkpoints store zero-centered norm weights;
+        # the latter use flat `language_model.*` names and `shards.N` PLE tables. oMLX oQ
+        # conversions use the same convention and carry a global PLE weight scale instead.
+        fold = any(
+            k.startswith("model.language_model.")
+            or (k.startswith("language_model.") and ".ngram_embedding.shards." in k)
+            or k.endswith(".ngram_embedding.weight_scale")
+            for k in weights
+        )
 
         out = {}
         # oMLX oQ/DWQ layout: a global PLE dequant scale next to the

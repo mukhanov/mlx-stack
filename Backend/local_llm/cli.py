@@ -1,14 +1,12 @@
-"""Commands and orchestration: run / stop / rm / list / help."""
+"""Commands and orchestration: serve / stop / rm / list / help."""
 import os
-import queue
 import signal
 import sys
 import threading
-from pathlib import Path
 
 import psutil
 
-from . import applog, clients, hf, llmfit, models, monitor, picker, servers, startup, ui, widget
+from . import applog, clients, hf, llmfit, models, servers, ui, widget
 from .applog import log
 from .config import Config
 
@@ -16,40 +14,39 @@ USAGE = """\
 local-llm — bring up a local model + an API for claude / pi / omp / opencode.
 
 What it does:
-  1. Shows local/recommended models (TUI: scroll, search, load-more from
-     HuggingFace, sorting by hardware fit, g toggles MLX / GGUF), downloads
-     the chosen one.
+  1. Fetches the model (MLX or GGUF), picking a GGUF quant that fits free
+     RAM unless you name one.
   2. Starts the model server (mlx_lm.server for MLX, llama-server for GGUF;
      OpenAI API), a tiny helper model (:8081, alias ollmlx/small — Claude
      Code's background calls like title generation, any client's quick
-     asks) and a litellm proxy (OpenAI /v1/chat/completions + Anthropic
-     /v1/messages for Claude Code) — as foreground children, no daemons:
-     exiting the monitor or Ctrl-C stops everything at once.
+     asks) and a client proxy (:4000, a thread of this process — OpenAI
+     requests relayed, Anthropic /v1/messages translated for Claude Code).
+     The servers are foreground children, no daemons: exiting or Ctrl-C
+     stops everything at once.
   3. Registers the model (+ the fixed alias ollmlx/local) in
      ~/.pi/agent/models.json, ~/.omp/agent/models.json,
      ~/.config/opencode/opencode.json and generates
-     ~/.ollmlx/claude-local.json.
-  4. Shows an htop-style TUI monitor: per-core CPU + a history graph,
-     RAM/swap, server status and the client launch commands.
+     ~/.mlx-stack/configs/claude.json.
+  4. Prints the client launch commands and serves until SIGTERM or Ctrl-C.
 
 Usage (symlink: ~/bin/local-llm):
-  local-llm                # interactive TUI model picker + monitor
-  local-llm <org/model>    # no questions asked (MLX or GGUF repo)
-  local-llm <org/model> <quant>   # GGUF: quant file to run
-                           # (Q4_K_M, iq4_xs, …; default: best for free RAM)
+  local-llm serve <org/model> [quant]  # run the stack in the foreground
+  local-llm <org/model> [quant]        # the same, without the word "serve"
+                           # GGUF quant: file name, quant name or a substring
+                           # of it (Q4_K_M, iq4_xs, …; default: best for free RAM)
   local-llm list           # show downloaded models (with sizes)
-  local-llm serve <org/model> [quant]  # headless: no TUI, block until SIGTERM
   local-llm widget           # native desktop monitor, updates every second
-  local-llm rm [org/repo…] # delete downloaded models from disk (no args — menu)
+  local-llm stop            # kill servers leaked from a previous run
+  local-llm rm [org/repo…] # delete downloaded models from disk (no args — prompt)
   local-llm token [hf_…]   # HF token: show / save / --clear (or env HF_TOKEN)
 
 Env: MLX_KV_BITS=8 (KV-cache quantization, 0=off), MLX_PROMPT_CACHE_BYTES (0=off),
      MLX_MAX_CTX=110000 (hard context ceiling for clients + server refusal),
-     MLX_PORT, LITELLM_PORT, WIDGET_PORT, LOAD_TIMEOUT, CLIENT_TIMEOUT=1800 (request/stream
-     seconds for litellm + clients), OLLMLX_HOME, HF_HUB_CACHE,
+     MLX_PORT, PROXY_PORT, WIDGET_PORT, LOAD_TIMEOUT, CLIENT_TIMEOUT=1800 (request/stream
+     seconds for the proxy + clients), MLX_STACK_HOME / OLLMLX_HOME, HF_HUB_CACHE,
      OLLMLX_SMALL_MODEL / MLX_SMALL_PORT (tiny helper model for fast calls),
      OLLMLX_LLAMA_SERVER (path to a llama-server binary; default: managed
-     download into ~/.ollmlx/llama.cpp for GGUF models)"""
+     download into ~/.mlx-stack/llama.cpp for GGUF models)"""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,29 +56,14 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("-h", "--help", "help"):
         print(USAGE)
         return 0
-    interactive = sys.stdout.isatty() and sys.stdin.isatty()
-    if interactive:
-        # the tab title is owned by the whole app run: set it the moment we
-        # start, hand it back exactly once at exit
-        ui.push_title()
-        ui.set_title("🟢 ollmlx")
-    try:
-        return _dispatch(argv, interactive)
-    finally:
-        if interactive:
-            ui.pop_title()
+    return _dispatch(argv)
 
 
-def _dispatch(argv: list[str], interactive: bool) -> int:
+def _dispatch(argv: list[str]) -> int:
     cfg = Config.from_env()
     if not argv:
-        model = picker.pick_model(cfg)
-        if model is None:
-            ui.warn("selection cancelled — exiting")
-            return 0
-        if interactive:
-            return run_stack_dialog(cfg, model)
-        return run_stack(cfg, model)
+        print(USAGE)
+        return 0
     cmd, rest = argv[0], argv[1:]
     if cmd == "stop":
         servers.stop_all(cfg.mlx_port)
@@ -102,14 +84,9 @@ def _dispatch(argv: list[str], interactive: bool) -> int:
         return run_serve(cfg, rest[0], rest[1] if len(rest) > 1 else None)
     if "/" in cmd:
         # second word (when given) is the GGUF quant: file name, quant name
-        # or any substring of it — run_stack sorts MLX vs GGUF out itself
-        return run_stack(cfg, cmd, quant=rest[0] if rest else None)
-    ui.warn(f"'{cmd}' doesn't look like org/model, opening the picker")
-    model = picker.pick_model(cfg)
-    if model is None:
-        ui.warn("selection cancelled — exiting")
-        return 0
-    return run_stack(cfg, model)
+        # or any substring of it — the boot sorts MLX vs GGUF out itself
+        return run_serve(cfg, cmd, rest[0] if rest else None)
+    raise SystemExit(f"   unknown command '{cmd}' — see local-llm --help")
 
 
 def _pick_gguf_group(model: str, groups, quant: str | None):
@@ -185,18 +162,22 @@ def _gguf_prepare(cfg: Config, model: str, quant: str | None = None):
     return path
 
 
-def run_stack(cfg: Config, model: str, launch_monitor: bool = True,
-              quant: str | None = None, meta: dict | None = None) -> int:
+def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
+    """Bring the stack up and return True once it is serving: pick and
+    fetch the weights, start the proxy and the model servers, write the
+    client configs, warm up, start the watchdog. False — the user declined
+    to start under memory pressure, so nothing is running. A startup
+    failure raises; the caller stops whatever was started."""
     # a port collision is a config error — fail before touching anything
     # (the second server would die on bind and _wait_ready would kill the run)
     if (cfg.mlx_port == cfg.mlx_small_port
-            or cfg.litellm_port in (cfg.mlx_port, cfg.mlx_small_port)):
+            or cfg.proxy_port in (cfg.mlx_port, cfg.mlx_small_port)):
         raise SystemExit(
             f"   port collision: mlx={cfg.mlx_port},"
-            f" small={cfg.mlx_small_port}, litellm={cfg.litellm_port}"
-            " — all three must differ (MLX_PORT / MLX_SMALL_PORT / LITELLM_PORT)")
+            f" small={cfg.mlx_small_port}, proxy={cfg.proxy_port}"
+            " — all three must differ (MLX_PORT / MLX_SMALL_PORT / PROXY_PORT)")
     # GGUF repos run llama-server in the mlx slot; everything above the
-    # port (litellm, clients, monitor) doesn't care which one it is.
+    # port (proxy, clients, the desktop app) doesn't care which one it is.
     # A registered LoRA alias downloads its exact base and adapter instead
     # of treating the PEFT repo as standalone MLX weights.
     lora = models.GGUF_LORAS.get(model)
@@ -206,12 +187,9 @@ def run_stack(cfg: Config, model: str, launch_monitor: bool = True,
     lora_path = (_gguf_prepare(cfg, lora["repo"], lora["file"])
                  if lora else None)
     backend = "llama" if gguf_path else "mlx"
-    if meta is not None:      # the startup dialog reads it after the boot
-        meta["backend"] = backend
-    servers.ensure_litellm()
-    log.info("stack start: model=%s backend=%s mlx=:%d small=:%d litellm=:%d",
+    log.info("stack start: model=%s backend=%s mlx=:%d small=:%d proxy=:%d",
              model, backend, cfg.mlx_port, cfg.mlx_small_port,
-             cfg.litellm_port)
+             cfg.proxy_port)
     ui.info(f"Model: {model}"
             + (f" · {gguf_path.name} (GGUF)" if gguf_path else "")
             + (f" + {lora_path.name} (LoRA)" if lora_path else ""))
@@ -275,7 +253,7 @@ def run_stack(cfg: Config, model: str, launch_monitor: bool = True,
         ui.warn(f"only {ui.human_bytes(avail)} RAM available, the model's"
                 f" weights are {ui.human_bytes(weights)} — under this"
                 " pressure a Metal OOM kills the server until restart")
-        if launch_monitor and sys.stdin.isatty():
+        if sys.stdin.isatty():
             try:
                 answer = input("?# Start anyway? [y/N] ").strip().lower()
             except EOFError:
@@ -283,71 +261,53 @@ def run_stack(cfg: Config, model: str, launch_monitor: bool = True,
             if not answer.startswith("y"):
                 ui.ok("cancelled — free memory first (`local-llm stop` kills"
                       " leftovers)")
-                return 0
+                return False
         else:
             ui.warn("non-interactive start — continuing")
 
-    try:
-        state = {"big": None, "small": None, "backend": backend,
-                 "gguf_path": str(gguf_path) if gguf_path else None,
-                 "lora_path": str(lora_path) if lora_path else None}
-        max_input = hf.safe_context(cfg.hf_hub, weights_model,
-                                    cfg.prompt_cache_bytes, cfg.max_ctx)
-        if meta is not None:
-            meta["max_input"] = max_input
-        if max_input < hf.model_ctx(cfg.hf_hub, weights_model):
-            ui.info(f"model context capped at {max_input} tokens"
-                    " (prompt-cache budget) — oversized requests are refused,"
-                    " clients compact before it OOMs")
-        state["big"] = (servers.start_llama(cfg, state["gguf_path"], model,
-                                            max_input, state["lora_path"])
-                        if gguf_path
-                        else servers.start_mlx(cfg, model, max_input))
-        if small_ok:
-            state["small"] = servers.start_mlx_small(cfg)
-        servers.start_litellm(cfg, model, small_ok)
-        clients.write_client_configs(cfg, model, small_ok, max_input)
-        servers.warmup(cfg)
-        log.info("stack ready: %s (max_input=%s, helper=%s)", model,
-                 max_input, cfg.small_model if small_ok else "off")
-        servers.supervise(cfg, model, state, max_input=max_input)
-        print()
-        ui.info(f"Ready. OpenAI and Anthropic APIs on"
-                f" http://127.0.0.1:{cfg.litellm_port}")
-        print(f"  pi:      pi --model ollmlx/local   ({model})")
-        print(f"  omp:     omp --model ollmlx/local   ({model})")
-        print(f"  opencode: opencode --model ollmlx/local   ({model})")
-        print(f"  claude:  claude --settings {cfg.claude_cfg}")
-        if small_ok:
-            print(f"  fast/bg: ollmlx/small  ({cfg.small_model} on"
-                  f" :{cfg.mlx_small_port} — titles, quick asks)")
-        print()
-        if not launch_monitor:
-            # handoff: the caller keeps the stack running and opens the UI
-            return cfg.mlx_small_port if small_ok else 0
-        ui.info("System monitor (q or Ctrl-C stops everything)")
-        home = str(Path.home())
-        monitor.run(model, cfg.mlx_port, cfg.litellm_port,
-                    str(cfg.claude_cfg).replace(home, "~"),
-                    cfg.mlx_small_port if small_ok else 0, backend,
-                    "omp --model ollmlx/local", max_input)
-    finally:
-        if launch_monitor:
-            servers.stop_watchdog()
-            servers.stop_children()
-    print()
-    log.info("stack stopped")
-    ui.ok(f"stopped — {'llama-server' if backend == 'llama' else 'mlx_lm.server'}"
-          " and litellm are down")
-    return 0
+    state = {"big": None, "small": None, "backend": backend,
+             "gguf_path": str(gguf_path) if gguf_path else None,
+             "lora_path": str(lora_path) if lora_path else None}
+    max_input = hf.safe_context(cfg.hf_hub, weights_model,
+                                cfg.prompt_cache_bytes, cfg.max_ctx,
+                                kv_bits=cfg.kv_bits)
+    if max_input < hf.model_ctx(cfg.hf_hub, weights_model):
+        ui.info(f"model context capped at {max_input} tokens"
+                " (prompt-cache budget) — oversized requests are refused,"
+                " clients compact before it OOMs")
+    servers.start_proxy(cfg, model, small_ok)
 
+    state["big"] = (servers.start_llama(cfg, state["gguf_path"], model,
+                                        max_input, state["lora_path"])
+                    if gguf_path
+                    else servers.start_mlx(cfg, model, max_input))
+    if small_ok:
+        state["small"] = servers.start_mlx_small(cfg)
+    clients.write_client_configs(cfg, model, small_ok, max_input)
+    servers.warmup(cfg)
+    log.info("stack ready: %s (max_input=%s, helper=%s)", model,
+             max_input, cfg.small_model if small_ok else "off")
+    servers.supervise(cfg, model, state, max_input=max_input)
+    print()
+    ui.info(f"Ready. OpenAI and Anthropic APIs on"
+            f" http://127.0.0.1:{cfg.proxy_port}")
+    print(f"  pi:      pi --model ollmlx/local   ({model})")
+    print(f"  omp:     omp --model ollmlx/local   ({model})")
+    print(f"  opencode: opencode --model ollmlx/local   ({model})")
+    print(f"  claude:  claude --settings {cfg.claude_cfg}")
+    if small_ok:
+        print(f"  fast/bg: ollmlx/small  ({cfg.small_model} on"
+              f" :{cfg.mlx_small_port} — titles, quick asks)")
+    print()
+    return True
 
 
 def run_serve(cfg: Config, model: str, quant: str | None = None) -> int:
-    """Headless stack for bots/cron: same boot as the interactive run
-    (quant pick, servers, watchdog) but no TUI — blocks until SIGTERM or
-    SIGINT, then stops the children cleanly. Port collisions and other
-    startup failures exit non-zero without killing a foreign stack."""
+    """The stack in the foreground, for terminals and bots/cron: same boot
+    as the desktop app (quant pick, servers, proxy, client configs,
+    watchdog), then blocks until SIGTERM or SIGINT and stops the children
+    cleanly. Port collisions and other startup failures exit non-zero
+    without killing a foreign stack."""
     stop = threading.Event()
 
     def _signal(_signum, _frame):
@@ -356,94 +316,27 @@ def run_serve(cfg: Config, model: str, quant: str | None = None) -> int:
     signal.signal(signal.SIGTERM, _signal)
     signal.signal(signal.SIGINT, _signal)
     try:
-        run_stack(cfg, model, launch_monitor=False, quant=quant)
-        log.info("serve: stack ready (%s) — waiting for SIGTERM/SIGINT", model)
-        print(f"serve: ready — model {model}; OpenAI/Anthropic on"
-              f" http://127.0.0.1:{cfg.litellm_port}; stop with SIGTERM",
-              flush=True)
+        started = _boot(cfg, model, quant)
     except BaseException as exc:  # startup failed: nothing to supervise
         servers.stop_watchdog()
         servers.stop_children()
         if isinstance(exc, SystemExit) and isinstance(exc.code, int):
             return exc.code
         raise
-    stop.wait()
-    log.info("serve: signal received — stopping the stack")
-    print("serve: stopping", flush=True)
-    servers.stop_watchdog()
-    servers.stop_children()
-    return 0
-
-def run_stack_dialog(cfg: Config, model: str) -> int:
-    """Picker -> fullscreen startup dialog -> straight into the monitor.
-    The stack boots in a worker thread with its output fed to the dialog;
-    on success the dialog hands the terminal to the monitor, on failure it
-    waits for a keypress over the error."""
-    lines: "queue.Queue[str]" = queue.Queue()
-    done = threading.Event()
-    meta: dict = {}      # run_stack reports which backend it booted
-    result: dict = {}    # exit code / error / handoff from the worker
-
-    def work():
-        old = sys.stdout, sys.stderr
-        sys.stdout = sys.stderr = startup.QueueWriter(lines)
-        try:
-            result["handoff"] = run_stack(cfg, model, launch_monitor=False,
-                                          meta=meta)
-            result["code"] = 0
-        except SystemExit as exc:
-            result["code"] = exc.code if isinstance(exc.code, int) else 1
-            if exc.code and not isinstance(exc.code, int):
-                result["error"] = str(exc.code)
-            log.error("stack start failed: %s", exc.code)
-        except KeyboardInterrupt:
-            result["code"] = 130
-            log.info("stack start interrupted")
-        except BaseException as exc:  # noqa: BLE001 — surfaced in the dialog
-            result["code"] = 1
-            result["error"] = f"{type(exc).__name__}: {exc}"
-            log.error("stack start crashed", exc_info=True)
-        finally:
-            sys.stdout, sys.stderr = old
-            if result.get("code"):
-                # failed — nothing to hand off, take the servers down
-                servers.stop_watchdog()
-                servers.stop_children()
-            done.set()
-
-    worker = threading.Thread(target=work, name="stack-start", daemon=True)
-    worker.start()
-    # the tab shows the boot right away; the monitor refines it per frame
-    ui.set_title(f"🟡 {model.split('/')[-1]}")
+    if not started:
+        return 0
+    log.info("serve: stack ready (%s) — waiting for SIGTERM/SIGINT", model)
+    print(f"serve: ready — model {model}; OpenAI/Anthropic on"
+          f" http://127.0.0.1:{cfg.proxy_port}; stop with Ctrl-C or SIGTERM",
+          flush=True)
     try:
-        startup.dialog(model, lines, done, result)
-    except KeyboardInterrupt:
-        ui.warn("interrupted — stopping the stack")
-        log.info("stack stopped (interrupted during startup)")
-        servers.stop_watchdog()
-        servers.stop_children()
-        worker.join(timeout=15)
-        return 130
-    worker.join(timeout=15)
-    code = result.get("code", 1)
-    if code:
-        if result.get("error"):
-            ui.warn(result["error"])
-        raise SystemExit(code)
-    try:
-        home = str(Path.home())
-        monitor.run(model, cfg.mlx_port, cfg.litellm_port,
-                    str(cfg.claude_cfg).replace(home, "~"),
-                    result.get("handoff", 0), meta.get("backend", "mlx"),
-                    "omp --model ollmlx/local", meta.get("max_input", 0))
+        stop.wait()
     finally:
+        # also on SIGHUP: the app-log hook turns it into SystemExit
+        log.info("serve: stopping the stack")
+        print("serve: stopping", flush=True)
         servers.stop_watchdog()
         servers.stop_children()
-    log.info("stack stopped")
-    print()
-    what = ("llama-server" if meta.get("backend") == "llama"
-            else "mlx_lm.server")
-    ui.ok(f"stopped — {what} and litellm are down")
     return 0
 
 

@@ -12,6 +12,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import psutil
+
 from . import ui
 
 # A local TUN proxy hands out fake IPs for *.huggingface.co / *.hf.co, on
@@ -85,6 +87,22 @@ def fetch_page(skip: int = 0, limit: int = 50, token: str | None = None,
                  "likes": m.get("likes", 0)} for m in models if m.get("id")]
     out.sort(key=lambda m: -m["downloads"])
     return out
+
+
+def fetch_stats(repo: str, token: str | None):
+    """Current downloads, likes and total repository size in bytes."""
+    install_doh()
+    req = urllib.request.Request(
+        f"https://huggingface.co/api/models/{repo}?blobs=true",
+        headers={"accept": "application/json"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode())
+    return {"downloads": int(data.get("downloads") or 0),
+            "likes": int(data.get("likes") or 0),
+            "size_bytes": sum(int(s.get("size") or 0)
+                              for s in data.get("siblings", []))}
 
 
 def repo_gguf_files(repo: str, token: str | None):
@@ -899,8 +917,29 @@ def model_kv_per_token(hf_hub: Path, repo: str) -> float | None:
     return 2 * kvh * hd * layers * 2
 
 
+def memory_cache_limit(hf_hub: Path, repo: str, reclaimable_bytes: int = 0):
+    """Prompt-cache bytes that fit available + reclaimed RAM after weights and reserve."""
+    available = psutil.virtual_memory().available + reclaimable_bytes
+    weights = model_disk_bytes(hf_hub, repo)
+    reserve = max(2 * 1024**3, int(available * 0.10))
+    return max(0, available - reserve - weights)
+
+
+def memory_context_limit(hf_hub: Path, repo: str, reclaimable_bytes: int = 0,
+                         reserved_cache_bytes: int = 0, kv_bits: int = 0):
+    """Context that keeps weights + KV + 10% reserve inside currently
+    available RAM. Conservative when the model is already loaded."""
+    kv = model_kv_per_token(hf_hub, repo) * ((kv_bits or 16) / 16)
+    if not kv:
+        return None
+    budget = max(0, memory_cache_limit(hf_hub, repo, reclaimable_bytes)
+               - reserved_cache_bytes)
+    return int(budget / kv)
+
+
 def safe_context(hf_hub: Path, repo: str, prompt_cache_bytes: int,
-                 cap: int = 110_000) -> int:
+                 cap: int = 110_000, reclaimable_bytes: int = 0,
+                 kv_bits: int = 0) -> int:
     """The context this model can actually serve on this machine: the
     config's window clamped to the hard cap and to what fits the
     prompt-cache budget with 10% headroom (a session past the ceiling dies
@@ -912,7 +951,12 @@ def safe_context(hf_hub: Path, repo: str, prompt_cache_bytes: int,
     if cap:
         lims.append(cap)
     if prompt_cache_bytes:
-        kv = model_kv_per_token(hf_hub, repo)
+        kv = model_kv_per_token(hf_hub, repo) * ((kv_bits or 16) / 16)
         if kv:
-            lims.append(int(prompt_cache_bytes / kv * 0.9))
-    return max(4096, min(lims))
+            lims.append(int(prompt_cache_bytes / kv))
+    ram_limit = memory_context_limit(hf_hub, repo, reclaimable_bytes,
+                                     prompt_cache_bytes, kv_bits)
+    if ram_limit is not None:
+        lims.append(ram_limit)
+    limit = min(lims)
+    return 0 if ctx >= 4096 and limit < 4096 else limit

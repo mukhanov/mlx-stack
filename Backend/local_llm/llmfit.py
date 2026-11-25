@@ -5,11 +5,11 @@ entries; quality/speed scores are computed client-side and not included, but
 context length, RAM guidance and capabilities are). We keep the MLX slice —
 mlx-community plus format=mlx repos from other authors (personal re-quants) —
 in a local gzip cache, refresh it weekly and surface context length +
-tool-use capability in the model picker.
+tool-use capability in the desktop app's model list.
 
 Also a faithful Python port of llmfit's composite fit score (llmfit-core
 src/fit.rs + src/models.rs, Apache-2.0), scoped to our platform: Apple
-Silicon, unified memory, MLX runtime. The picker sorts by it — same ranking
+Silicon, unified memory, MLX runtime. The model catalog sorts by it — same ranking
 the llmfit CLI shows for this machine."""
 import datetime
 import gzip
@@ -37,10 +37,10 @@ def _is_mlx(m: dict) -> bool:
             or str(m.get("name", "")).startswith(PREFIX))
 
 
-def load(ollmlx_home: Path) -> dict | None:
+def load(ollmlx_home: Path, refresh: bool = False) -> dict | None:
     """{repo_id: catalog entry} for MLX-format models, or None when nothing
     is available (no cache and no network). A failed refresh falls back to
-    the stale cache."""
+    the stale cache. refresh=True bypasses the weekly TTL for the UI action."""
     cache = ollmlx_home / CACHE_NAME
     models: dict | None = None
     fetched_at = 0.0
@@ -51,7 +51,7 @@ def load(ollmlx_home: Path) -> dict | None:
             fetched_at, models = blob["fetched_at"], blob["models"]
     except Exception:
         pass
-    if models is not None and time.time() - fetched_at < TTL_DAYS * 86400:
+    if not refresh and models is not None and time.time() - fetched_at < TTL_DAYS * 86400:
         return models
     ui.info("Fetching the llmfit model catalog (MLX slice)")
     try:

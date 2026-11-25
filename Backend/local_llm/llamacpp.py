@@ -4,7 +4,7 @@ minimal GGUF header parser.
 llama.cpp ships no pip package and its `/releases/latest` tag carries no
 binaries — real builds are per-commit prereleases tagged b<N> with assets
 like `llama-b<N>-bin-macos-arm64.tar.gz` (researched 2026-10-26). We
-download one known-good build into ~/.ollmlx/llama.cpp/llama-b<N>/ and pin
+download one known-good build into ~/.mlx-stack/llama.cpp/llama-b<N>/ and pin
 it there: no silent upgrades, re-download only when the pin is missing.
 
 The binary needs its dylibs next to it (rpath-relative), so the whole
@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 from . import ui
+from .config import stack_home
 
 _RELEASES = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10"
 _ASSET = "llama-{tag}-bin-macos-arm64.tar.gz"
@@ -39,7 +40,7 @@ def _fetch(url, timeout: int, tries: int = 4):
 
 
 def _llama_root() -> Path:
-    return Path(os.environ.get("OLLMLX_HOME", "~/.ollmlx")).expanduser() / "llama.cpp"
+    return stack_home() / "llama.cpp"
 
 
 def _latest_asset() -> tuple[str, str]:
@@ -89,7 +90,7 @@ def _download_build(root: Path) -> str:
 def ensure_llama_server(override: str = "") -> str:
     """Absolute path to a llama-server binary: the explicit override >
     OLLMLX_LLAMA_SERVER > PATH > the managed download under
-    ~/.ollmlx/llama.cpp (pinned to the build recorded in build.txt)."""
+    ~/.mlx-stack/llama.cpp (pinned to the build recorded in build.txt)."""
     override = override or os.environ.get("OLLMLX_LLAMA_SERVER", "")
     if override:
         p = Path(override).expanduser()

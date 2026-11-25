@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=${1:-0.1.4}
+VERSION=${1:-0.1.5}
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 APP="$ROOT/build/MLX Stack.app"
 BINARY="$APP/Contents/MacOS/MLXStack"
@@ -15,6 +15,9 @@ UV=${UV:-$(command -v uv 2>/dev/null || true)}
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin" "$ROOT/releases"
 swiftc -O -parse-as-library "$ROOT/Sources/MLXStack.swift" \
+  "$ROOT/Sources/ModelManager.swift" \
+  "$ROOT/Sources/ToolsView.swift" \
+  "$ROOT/Sources/MemoryBudget.swift" \
   -o "$BINARY" -framework SwiftUI -framework AppKit
 cp "$ROOT/Resources/Info.plist" "$PLIST"
 cp "$ROOT/Resources/MLX Stack.icns" "$APP/Contents/Resources/MLX Stack.icns"

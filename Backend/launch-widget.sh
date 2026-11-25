@@ -3,7 +3,8 @@
 # failures beside the backend's persistent logs.
 set -eu
 APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-OLLMLX="${OLLMLX_HOME:-$HOME/.ollmlx}"
+. "$APP_DIR/mlx-stack-home.sh"
+mlx_stack_home
 LOG="$OLLMLX/logs/mlx-stack.log"
 mkdir -p "$OLLMLX/logs"
 if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG")" -gt 1048576 ]; then
