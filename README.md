@@ -37,6 +37,7 @@ The backend needs three Python packages — `mlx-lm`, `huggingface-hub` and `psu
 - Downloads run in the background while the loaded models keep serving. They show percentage, bytes and speed, can be paused, resumed and cancelled, and resume after a restart.
 - Deleted models are remembered and marked in the catalog; they come back only through an explicit download.
 - **Load…** opens the launch parameters: context and prompt cache sized against a shared RAM budget, KV-cache quantization, sampling (temperature, top-p, top-k, min-p), max tokens and the load and client timeouts, with a live forecast of memory use once the cache is full. They are saved per model in `~/.mlx-stack/model-settings.json`; **Defaults** returns to the stack-wide values.
+- Loading shows what is happening right away: the model's row and Monitor show a progress bar with the stage and the elapsed seconds. It fills as the weights come into memory (resident memory against their size on disk), then goes through *Starting helper model* and *Warming up*. A failed start is reported with its reason.
 - Models can be loaded from the window or from the status-bar menu. A stack started from a terminal is shown in Monitor and Tools but never taken over.
 
 ## Monitor
@@ -124,6 +125,7 @@ Ports and limits are set with environment variables. In the app, the launch para
 ├── llama.cpp/              pinned llama-server build for GGUF models
 ├── model-settings.json     launch parameters per model
 ├── context-settings.json   stack-wide context and prompt-cache limits
+├── launch.json             stage of the model being loaded, removed when it serves
 ├── downloads.json          unfinished downloads
 ├── deleted-models.json     models deleted locally
 └── hf-token                Hugging Face token

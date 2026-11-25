@@ -41,6 +41,14 @@ BACKOFF = 600.0
 children: list[subprocess.Popen] = []
 
 
+class StartupFailed(SystemExit):
+    """A server did not come up. `reason` is one line for the user; the
+    exit status is 1, like any other failed start."""
+    def __init__(self, reason: str):
+        super().__init__(1)
+        self.reason = reason
+
+
 def http_ok(url: str, timeout: float = 2.0) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -180,7 +188,7 @@ def supervise(cfg, model: str, state: dict, max_input: int | None = None) -> Non
             _note(f"{'llama-server' if llama else 'mlx'} restarted"
                   f" ({reason}) — stack healthy again")
         except (SystemExit, OSError) as exc:
-            _note(f"restart failed ({reason}): {exc}")
+            _note(f"restart failed ({reason}): {getattr(exc, 'reason', exc)}")
 
     def run():
         bad = 0
@@ -256,8 +264,8 @@ def start_proxy(cfg, model: str, small_ok: bool) -> None:
                                cfg.mlx_small_port if small_ok else 0),
             cfg.api_key, cfg.client_timeout, access)
     except OSError as exc:
-        raise SystemExit(
-            f"   cannot bind the client proxy to {HOST}:{cfg.proxy_port}"
+        raise StartupFailed(
+            f"cannot bind the client proxy to {HOST}:{cfg.proxy_port}"
             f" ({exc.strerror or exc}) — port busy (PROXY_PORT) or another"
             " stack is still running") from None
     threading.Thread(target=server.serve_forever, name="client-proxy",
@@ -328,7 +336,7 @@ def _start(cmd: list[str], env, logpath: str, url: str, timeout: int,
         log.error("%s %s — tail of %s:", what, problem, logpath)
         ui.warn(f"{what} {problem}:")
         print("\n".join(monitor.tail_lines(logpath, 30)))
-        raise SystemExit(1)
+        raise StartupFailed(f"{what} {problem}")
     print(f"\r   ready in {waited}s        ")
     log.info("%s ready in %ds (%s)", what, waited, url)
     return proc
@@ -506,4 +514,4 @@ def warmup(cfg) -> None:
             if lines:
                 print(f"--- last lines of {path} ---")
                 print("\n".join(lines))
-        raise SystemExit(1) from None
+        raise StartupFailed("the warm-up request failed: the model did not answer") from None

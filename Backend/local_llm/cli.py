@@ -3,12 +3,13 @@ import os
 import signal
 import sys
 import threading
+import time
 
 import psutil
 
 from . import applog, clients, hf, llmfit, models, servers, ui, widget
 from .applog import log
-from .config import Config
+from .config import Config, write_json
 from .net import HOST
 
 USAGE = """\
@@ -40,6 +41,45 @@ MLX_PROMPT_CACHE_BYTES, MLX_KV_BITS, MLX_KV_GROUP_SIZE, LOAD_TIMEOUT,
 CLIENT_TIMEOUT, OLLMLX_TEMP, OLLMLX_TOP_P, OLLMLX_TOP_K, OLLMLX_MIN_P,
 OLLMLX_MAX_TOKENS; OLLMLX_SMALL_MODEL (helper model), OLLMLX_LLAMA_SERVER
 (path to a llama-server binary; default: a managed download)."""
+
+
+class LaunchProgress:
+    """What the app shows while the stack comes up. The controller writes
+    its stage to ~/.mlx-stack/launch.json, the local API hands it to the
+    window, and the record goes away once the stack serves."""
+
+    def __init__(self, cfg: Config, model: str):
+        self.path = cfg.home / "launch.json"
+        self.record = {"model": model, "pid": os.getpid(), "started": time.time()}
+
+    def _write(self, **fields) -> None:
+        try:
+            write_json(self.path, {**self.record, **fields})
+        except OSError:
+            pass   # progress is for the window: it must not break a launch
+
+    def stage(self, name: str) -> None:
+        self._write(stage=name)
+
+    def done(self) -> None:
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def failed(self, reason: str, status: int = 1) -> None:
+        self._write(stage="failed", status=status, error=reason)
+
+
+def _failure(exc: BaseException) -> str:
+    """One line for the user on why the stack did not come up."""
+    reason = getattr(exc, "reason", None)
+    if reason:
+        return reason
+    if isinstance(exc, SystemExit):
+        code = exc.code
+        return code.strip() if isinstance(code, str) else f"exit status {code}"
+    return f"{type(exc).__name__}: {exc}"[:200]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -147,12 +187,14 @@ def _gguf_prepare(cfg: Config, model: str, quant: str | None = None):
     return path
 
 
-def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
+def _boot(cfg: Config, model: str, quant: str | None,
+          progress: LaunchProgress) -> bool:
     """Bring the stack up and return True once it is serving: pick and
     fetch the weights, start the proxy and the model servers, write the
-    client configs, warm up, start the watchdog. False — the user declined
-    to start under memory pressure, so nothing is running. A startup
-    failure raises; the caller stops whatever was started."""
+    client configs, warm up, start the watchdog — telling `progress` each
+    stage on the way. False — the user declined to start under memory
+    pressure, so nothing is running. A startup failure raises; the caller
+    stops whatever was started."""
     # a port collision is a config error — fail before touching anything
     # (the second server would die on bind and _wait_ready would kill the run)
     if (cfg.mlx_port == cfg.mlx_small_port
@@ -161,6 +203,7 @@ def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
             f"   port collision: mlx={cfg.mlx_port},"
             f" small={cfg.mlx_small_port}, proxy={cfg.proxy_port}"
             " — all three must differ (MLX_PORT / MLX_SMALL_PORT / PROXY_PORT)")
+    progress.stage("prepare")
     # whatever an interrupted run left on these ports must not hold RAM
     servers.stop_stale(cfg)
     # GGUF repos run llama-server in the mlx slot; everything above the
@@ -263,17 +306,21 @@ def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
              "gguf_path": str(gguf_path) if gguf_path else None,
              "lora_path": str(lora_path) if lora_path else None}
     servers.start_proxy(cfg, model, small_ok)
+    progress.stage("weights")
     state["big"] = (servers.start_llama(cfg, state["gguf_path"], model,
                                         max_input, state["lora_path"])
                     if gguf_path
                     else servers.start_mlx(cfg, model, max_input))
     if small_ok:
+        progress.stage("helper")
         state["small"] = servers.start_mlx_small(cfg)
     clients.write_client_configs(cfg, model, small_ok, max_input)
+    progress.stage("warmup")
     servers.warmup(cfg)
     log.info("stack ready: %s (max_input=%s, helper=%s)", model,
              max_input, cfg.small_model if small_ok else "off")
     servers.supervise(cfg, model, state, max_input=max_input)
+    progress.done()
     print()
     ui.info(f"Ready. OpenAI and Anthropic APIs on"
             f" http://{HOST}:{cfg.proxy_port}")
@@ -299,15 +346,19 @@ def run_serve(cfg: Config, model: str, quant: str | None = None) -> int:
 
     signal.signal(signal.SIGTERM, _signal)
     signal.signal(signal.SIGINT, _signal)
+    progress = LaunchProgress(cfg, model)
     try:
-        started = _boot(cfg, model, quant)
+        started = _boot(cfg, model, quant, progress)
     except BaseException as exc:  # startup failed: nothing to supervise
         servers.stop_watchdog()
         servers.stop_children()
+        status = exc.code if isinstance(exc, SystemExit) and isinstance(exc.code, int) else 1
+        progress.failed(_failure(exc), status)
         if isinstance(exc, SystemExit) and isinstance(exc.code, int):
             return exc.code
         raise
     if not started:
+        progress.done()
         return 0
     log.info("serve: stack ready (%s) — waiting for SIGTERM/SIGINT", model)
     print(f"serve: ready — model {model}; OpenAI/Anthropic on"

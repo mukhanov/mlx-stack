@@ -80,6 +80,67 @@ def _main_model(cfg) -> str | None:
     return _loaded_model(procs, True, cfg.mlx_port)
 
 
+# The stages a controller goes through while it brings a stack up
+# (cli._boot); the window shows each one as the model loads.
+LAUNCH_STAGES = ("prepare", "weights", "helper", "warmup")
+_RSS_BASE = 512 * 1024**2   # a model server's footprint before any weights
+
+
+def _launch_record(cfg) -> dict:
+    """launch.json — what the controller that loads a model last wrote
+    (cli.LaunchProgress); {} when there is none."""
+    try:
+        record = json.loads((cfg.home / "launch.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _drop_launch_record(cfg) -> None:
+    try:
+        (cfg.home / "launch.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _launch_in_progress(cfg, main_rss: int) -> dict | None:
+    """The load under way and how far it has got, or None. The weights
+    count as loaded in step with the model server's resident memory: once
+    they are all in, its RSS is about their size on disk."""
+    record = _launch_record(cfg)
+    stage, started = record.get("stage"), record.get("started")
+    if stage not in LAUNCH_STAGES or not isinstance(started, (int, float)):
+        return None
+    age = time.time() - started
+    if not 0 <= age < 3600:
+        return None
+    try:   # a hard-killed controller leaves its record behind
+        cmd = " ".join(psutil.Process(record["pid"]).cmdline())
+    except (psutil.Error, KeyError, TypeError):
+        return None
+    if "local_llm" not in cmd or " serve" not in cmd:
+        return None
+    launch = {"model": record.get("model"), "stage": stage, "started": started,
+              "elapsed": int(age), "fraction": None}
+    weights = hf.model_disk_bytes(cfg.hf_hub, launch["model"])
+    if stage == "weights" and weights:
+        launch["fraction"] = min(1.0, max(0.0, (main_rss - _RSS_BASE) / weights))
+    return launch
+
+
+def _launch_failure(cfg, main_up: bool) -> dict | None:
+    """Why the last launch stopped, for the window. Nothing once a stack
+    serves: that has put the failure to rest."""
+    record = _launch_record(cfg)
+    if record.get("stage") != "failed":
+        return None
+    if main_up:
+        _drop_launch_record(cfg)
+        return None
+    return {"model": record.get("model"), "status": record.get("status", 1),
+            "reason": record.get("error")}
+
+
 class RequestTracker:
     """Monotonic per-log request counters; reads only bytes appended since the
     previous snapshot. MLX starts increment active; llama.cpp ends with eval."""
@@ -148,6 +209,9 @@ class StackController:
         self.request_tracker = RequestTracker()
         self.downloads = None
         self.lock = threading.Lock()
+        # a failure from before this app session ran is history
+        if _launch_record(cfg).get("stage") == "failed":
+            _drop_launch_record(cfg)
 
     def _load_deleted(self):
         try:
@@ -560,11 +624,17 @@ def snapshot(cfg, controller) -> dict:
     model = _loaded_model(procs, main_up, cfg.mlx_port) or "no model loaded"
     small_model = (_loaded_model(procs, small_up, cfg.mlx_small_port, helper=True)
                    if small_up else None)
-    launch_error = None
-    if controller.proc is not None and not main_up:
+    launch = _launch_in_progress(
+        cfg, sum(r["rss"] for r in rows if r["name"] != "mlx-small"))
+    launch_error = _launch_failure(cfg, main_up)
+    if (launch_error is None and launch is None and not main_up
+            and controller.proc is not None and controller.current):
+        # our own controller ended without saying why (a kill, a crash
+        # before it could record it)
         status = controller.proc.poll()
-        if status is not None and controller.current:
-            launch_error = {"model": controller.current, "status": status}
+        if status is not None:
+            launch_error = {"model": controller.current, "status": status,
+                            "reason": "the model process ended without reporting"}
     logs = [(tag, line) for tag, path in (
                 (backend, main_log), ("proxy", servers.PROXY_LOG),
                 ("mlx-small", servers.MLX_SMALL_LOG),
@@ -580,6 +650,7 @@ def snapshot(cfg, controller) -> dict:
         "model": model,
         "small_model": small_model,
         "launch_error": launch_error,
+        "launch": launch,
         "backend": backend,
         "uptime_seconds": uptime,
         "max_input": _advertised_context(cfg),

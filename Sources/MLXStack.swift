@@ -441,11 +441,23 @@ struct Snapshot: Decodable {
     struct LaunchError: Decodable {
         let model: String
         let status: Int
+        let reason: String?
+    }
+
+    /// A model being loaded: the stage the backend is in and, once the
+    /// weights are being read, how much of them is in memory.
+    struct Launch: Decodable {
+        let model: String
+        let stage: String
+        let started: Double
+        let elapsed: Int
+        let fraction: Double?
     }
 
     let model: String
     let smallModel: String?
     let launchError: LaunchError?
+    let launch: Launch?
     let backend: String
     let uptimeSeconds: Int
     let maxInput: Int
@@ -602,6 +614,32 @@ struct Derived {
     let errorCount: Int
 }
 
+/// What the window shows while a model loads. `stage` is empty until the
+/// backend reports one; `fraction` is the share of the weights in memory.
+struct LaunchProgress: Equatable {
+    let model: String
+    let started: Double
+    let stage: String
+    let elapsed: Int
+    let fraction: Double?
+
+    var title: String {
+        switch stage {
+        case "prepare": return "Preparing model"
+        case "weights": return "Loading weights"
+        case "helper": return "Starting helper model"
+        case "warmup": return "Warming up"
+        default: return "Starting"
+        }
+    }
+
+    /// "Loading weights · 43% · 12s"
+    var label: String {
+        let share = stage == "weights" ? fraction.map { " · \(percent($0))" } : nil
+        return title + (share ?? "") + " · \(elapsed)s"
+    }
+}
+
 // MARK: - poller + state machine
 
 @MainActor
@@ -617,6 +655,8 @@ final class PanelModel: ObservableObject {
     @Published private(set) var modelActionInProgress = false
     @Published private(set) var loadingModel: String?
     @Published private(set) var loadError: Snapshot.LaunchError?
+    /// The load under way, whoever started it; nil once the stack serves.
+    @Published private(set) var launch: LaunchProgress?
     @Published var actionError: String?
     @Published var copiedCommand: String?
     @Published var selectedModel: MonitorModel = .main
@@ -642,6 +682,8 @@ final class PanelModel: ObservableObject {
     private var lastModel: String?
     private var lastSmallModel: String?
     private var lastUptime: Int?
+    private var loadingSince = Date()   // when Load was clicked
+    private var launchSeen = false      // the backend has reported this launch
 
     private let session: URLSession
     private var pollTask: Task<Void, Never>?
@@ -675,6 +717,10 @@ final class PanelModel: ObservableObject {
         modelActionInProgress = true
         actionError = nil
         loadError = nil
+        loadingModel = name
+        launchSeen = false
+        loadingSince = Date()
+        launch = LaunchProgress(model: name, started: 0, stage: "", elapsed: 0, fraction: nil)
         Task {
             defer { modelActionInProgress = false }
             do {
@@ -692,7 +738,10 @@ final class PanelModel: ObservableObject {
                                       payload?["error"] ?? "model launch failed"])
                 }
             } catch {
-                if loadingModel == name { loadingModel = nil }
+                if loadingModel == name {
+                    loadingModel = nil
+                    launch = nil
+                }
                 actionError = "Couldn't load \(name). \(error.localizedDescription)"
             }
         }
@@ -1020,11 +1069,37 @@ final class PanelModel: ObservableObject {
             topMem: topMem,
             logRows: logRows,
             errorCount: errorCount)
+        updateLaunch(snap)
+    }
+
+    /// Follows the load under way as the backend reports it. A fraction
+    /// never goes backwards within one launch, and a launch this app asked
+    /// for ends when the backend stops reporting it: the stack serves then.
+    private func updateLaunch(_ snap: Snapshot) {
+        var reported = snap.launch.map { value in
+            let previous = launch.flatMap {
+                $0.model == value.model && $0.started == value.started ? $0 : nil
+            }
+            return LaunchProgress(model: value.model, started: value.started,
+                                  stage: value.stage, elapsed: value.elapsed,
+                                  fraction: value.fraction.map { max(previous?.fraction ?? 0, $0) })
+        }
+        if let reported, reported.model == loadingModel { launchSeen = true }
+        if reported == nil, let loadingModel, !launchSeen {
+            // Load was clicked; the backend has not started reporting yet
+            reported = LaunchProgress(model: loadingModel, started: 0, stage: "",
+                                      elapsed: Int(Date().timeIntervalSince(loadingSince)),
+                                      fraction: nil)
+        }
+        launch = reported
         if let error = snap.launchError, error.model == loadingModel {
             loadingModel = nil
             loadError = error
+            launch = nil
         }
-        if loadingModel == snap.model, snap.ports.main.up {
+        let serving = snap.ports.main.up && snap.model == loadingModel
+        if loadingModel != nil, snap.launch == nil,
+           launchSeen || serving || Date().timeIntervalSince(loadingSince) > 30 {
             loadingModel = nil
             loadError = nil
         }
@@ -1202,8 +1277,10 @@ struct MonitorHeader: View {
                     .foregroundStyle(C.dim)
             }
             HStack(spacing: 18) {
-                ModelIdentity(role: "Main", name: d.model, active: d.model != "no model loaded",
-                              activity: model.selectedModel == .main ? activityState : nil)
+                ModelIdentity(role: "Main", name: model.launch?.model ?? d.model,
+                              active: d.model != "no model loaded" || model.launch != nil,
+                              activity: model.selectedModel == .main ? activityState : nil,
+                              progress: model.launch)
                 ModelIdentity(role: "Small", name: d.smallModel ?? "not loaded",
                               active: d.smallModel != nil,
                               activity: model.selectedModel == .small ? activityState : nil)
@@ -1232,6 +1309,7 @@ struct MonitorHeader: View {
     }
 
     private var activityState: ActivityState {
+        if model.launch != nil { return .loading }
         if d.model == "no model loaded" && d.smallModel == nil { return .noModel }
         if selectedActive > 0 { return .active }
         if selectedTok.cur > 0 && selectedTok.txt.contains("prefill") { return .prefilling }
@@ -1246,6 +1324,7 @@ private struct ModelIdentity: View {
     let name: String
     let active: Bool
     let activity: ActivityState?
+    var progress: LaunchProgress? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -1260,6 +1339,9 @@ private struct ModelIdentity: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
+            if let progress {
+                LaunchProgressView(progress: progress)
+            }
         }
         .font(mono(11))
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1267,8 +1349,31 @@ private struct ModelIdentity: View {
     }
 }
 
+/// The load under way: a bar that fills as the weights come in, an
+/// animated one while there is nothing to measure, and the stage.
+struct LaunchProgressView: View {
+    let progress: LaunchProgress
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let fraction = progress.fraction, progress.stage == "weights" {
+                ProgressView(value: fraction).tint(C.cyan)
+            } else {
+                ProgressView().progressViewStyle(.linear).tint(C.cyan)
+            }
+            Text(progress.label)
+                .font(mono(10))
+                .foregroundStyle(C.dim)
+                .lineLimit(1)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Loading \(progress.model)")
+        .accessibilityValue(progress.label)
+    }
+}
+
 private enum ActivityState {
-    case idle, generating, prefilling, active, noModel
+    case idle, generating, prefilling, active, noModel, loading
 
     var title: String {
         switch self {
@@ -1277,6 +1382,7 @@ private enum ActivityState {
         case .prefilling: return "Prefilling"
         case .active: return "Active requests"
         case .noModel: return "No model"
+        case .loading: return "Loading"
         }
     }
 
@@ -1287,6 +1393,7 @@ private enum ActivityState {
         case .prefilling: return "hourglass"
         case .active: return "arrow.triangle.2.circlepath"
         case .noModel: return "circle.dashed"
+        case .loading: return "arrow.down.circle"
         }
     }
 
@@ -1297,6 +1404,7 @@ private enum ActivityState {
         case .prefilling: return C.yellow
         case .active: return C.cyan
         case .noModel: return C.dim
+        case .loading: return C.cyan
         }
     }
 }
@@ -1455,7 +1563,7 @@ struct PanelContent: View {
 
     @ViewBuilder private var notices: some View {
         if let error = model.loadError {
-            MonitorNotice(text: "Model launch failed (status \(error.status)). Review the logs before retrying.",
+            MonitorNotice(text: "Model launch failed: \(error.reason ?? "exit status \(error.status)"). Review the logs before retrying.",
                           actionTitle: "Review logs", action: showLogs)
         }
         if d.errorCount > 0 {

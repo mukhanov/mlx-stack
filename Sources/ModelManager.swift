@@ -1328,7 +1328,9 @@ private struct DownloadedModelRow: View {
             || panel.derived?.smallModel == item.id
     }
     private var active: Bool { loaded }
-    private var loading: Bool { panel.loadingModel == item.id }
+    private var loading: Bool {
+        panel.loadingModel == item.id || panel.launch?.model == item.id
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1380,8 +1382,12 @@ private struct DownloadedModelRow: View {
             if item.downloading {
                 DownloadProgressView(item: item)
             }
+            if loading, let progress = panel.launch {
+                LaunchProgressView(progress: progress)
+                    .padding(.leading, 62)
+            }
             if let error = panel.loadError, error.model == item.id {
-                Text("Couldn't launch \(item.id) (status \(error.status)). Review the log lines below before retrying.")
+                Text("Couldn't launch \(item.id): \(error.reason ?? "exit status \(error.status)"). Review the log lines below before retrying.")
                     .font(.callout)
                     .foregroundStyle(C.red)
                 LogRowsView(rows: panel.derived?.logRows ?? [], followsTail: false)
