@@ -1322,12 +1322,13 @@ private struct ServiceStatusChip: View {
         HStack(spacing: 5) {
             Image(systemName: chip.up ? "checkmark.circle.fill" : "xmark.circle.fill")
                 .accessibilityHidden(true)
-            Text("\(chip.service) :\(chip.port)")
+            // verbatim: a Text literal formats an Int with digit grouping ("19 797")
+            Text(verbatim: "\(chip.service) :\(chip.port)")
         }
         .font(.system(size: 11, weight: .medium))
         .foregroundStyle(chip.up ? C.green : C.red)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(chip.service) \(chip.up ? "running" : "stopped") on port \(chip.port)")
+        .accessibilityLabel(Text(verbatim: "\(chip.service) \(chip.up ? "running" : "stopped") on port \(chip.port)"))
     }
 }
 
