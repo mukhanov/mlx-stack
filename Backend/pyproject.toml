@@ -12,7 +12,8 @@ dependencies = [
     # 5.x already forbids 2.x (httpx2 rewrite); the cap keeps it explicit if
     # that ever changes — hf.py scans blobs/ and .incomplete files directly.
     "huggingface-hub>=1.0,<2.0",
-    # desktop monitor: per-core CPU, process RSS
+    # the app's Monitor, sampled once a second: per-core CPU load and
+    # per-process CPU time — mach calls the standard library doesn't expose
     "psutil>=5.9",
 ]
 

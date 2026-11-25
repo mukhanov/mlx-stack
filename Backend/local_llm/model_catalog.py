@@ -17,7 +17,7 @@ class ModelCatalog:
 
     def _load_llmfit(self, refresh=False):
         if self.lf is None or refresh:
-            loaded = llmfit.load(self.cfg.ollmlx_home, refresh=refresh)
+            loaded = llmfit.load(self.cfg.home, refresh=refresh)
             if loaded is not None:
                 self.lf = loaded
         return self.lf

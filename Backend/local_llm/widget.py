@@ -1,7 +1,9 @@
-"""Native desktop monitor: local snapshot API and SwiftUI app launcher.
+"""The app's local API: the monitor snapshot, the model catalog, downloads,
+launch settings and load/stop control.
 
-Reads the stack's logs and processes through the telemetry readers in
-monitor.py. The HTTP server binds localhost and lives as long as the app."""
+Reads the stack's logs and processes through monitor.py and loads models as
+`local-llm serve` children. The HTTP server binds loopback and lives as long
+as the app."""
 import json
 import os
 import signal
@@ -17,60 +19,65 @@ from pathlib import Path
 import psutil
 
 from . import applog, clients, hf, monitor, servers
-from .applog import logs_dir
-from .config import Config
+from .config import LOCAL_ALIAS, SETTING_ENV, Config, launch_settings_from, write_json
 from .model_catalog import ModelCatalog
+from .net import HOST, from_web_page, loopback_host
 
 
-def _client_state():
-    """Current model and its advertised cap from the generated OMP catalog."""
-    f = Path("~/.omp/agent/models.json").expanduser()
+def _advertised_context(cfg) -> int:
+    """Context the stack advertises to its clients for the model it serves
+    — the KV-safe budget, not the config maximum. 0 until a catalog exists."""
     try:
-        models = json.loads(f.read_text())["providers"]["ollmlx"]["models"]
-    except (OSError, ValueError, KeyError, TypeError):
-        return "local", 0
-    model = next((m["id"] for m in models
-                  if m.get("id") not in ("local", "small")), "local")
-    local = next((m for m in models if m.get("id") == "local"), {})
-    return model, int(local.get("contextWindow", 0))
+        models = json.loads((cfg.home / "configs" / "omp-models.json")
+                            .read_text())["providers"]["ollmlx"]["models"]
+        local = next(m for m in models if m.get("id") == LOCAL_ALIAS)
+        return int(local.get("contextWindow", 0))
+    except (OSError, ValueError, KeyError, TypeError, StopIteration):
+        return 0
 
 
-def _backend():
-    """Backend of the latest stack start, or mlx for an old/empty app.log."""
-    path = logs_dir() / "app.log"
-    for line in reversed(monitor.tail_lines(path, 200)):
-        if "stack start:" in line and " backend=llama" in line:
-            return "llama"
+def _backend() -> str:
+    """Backend of the latest stack start: llama for GGUF weights, else mlx."""
+    for line in reversed(monitor.tail_lines(applog.logs_dir() / "app.log", 200)):
         if "stack start:" in line:
-            return "mlx"
+            return "llama" if " backend=llama" in line else "mlx"
     return "mlx"
 
 
-def _loaded_model(procs, server_up, port, helper=False):
-    """Actual process model for the main server or the helper, not a catalog guess."""
-    for name, p in procs:
-        if helper:
-            if name != "mlx-small":
-                continue
-        elif name not in ("mlx_lm.server", "llama-server"):
+def _loaded_model(procs, server_up: bool, port: int,
+                  helper=False) -> str | None:
+    """The model a server serves: read from its command line, else from
+    what it reports on its port while that port is up."""
+    wanted = ("mlx-small",) if helper else ("mlx_lm.server", "llama-server")
+    for name, proc in procs:
+        if name not in wanted:
             continue
         try:
-            cmd = p.cmdline()
+            cmd = proc.cmdline()
             flag = "-a" if name == "llama-server" else "--model"
             if flag in cmd:
                 return cmd[cmd.index(flag) + 1]
         except (psutil.NoSuchProcess, psutil.AccessDenied, IndexError):
             pass
-    if server_up:
-        try:
-            with urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/v1/models", timeout=0.5) as r:
-                data = json.load(r).get("data", [])
-            if data and isinstance(data[0].get("id"), str):
-                return data[0]["id"]
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
+    if not server_up:
+        return None
+    try:
+        with urllib.request.urlopen(f"http://{HOST}:{port}/v1/models",
+                                    timeout=0.5) as r:
+            data = json.load(r).get("data", [])
+        if data and isinstance(data[0].get("id"), str):
+            return data[0]["id"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
     return None
+
+
+def _main_model(cfg) -> str | None:
+    """The model the main server serves while its port is up."""
+    if not monitor.port_ok(cfg.mlx_port):
+        return None
+    procs = monitor.watch_procs(cfg.mlx_small_port, cfg.mlx_port)
+    return _loaded_model(procs, True, cfg.mlx_port)
 
 
 class RequestTracker:
@@ -126,14 +133,13 @@ def _perf(path, request_tracker=None):
 
 
 class StackController:
-    """Models launched by the tray remain its foreground children.
+    """Models launched by the app remain its foreground children.
 
     A stack started elsewhere is never taken over: its watchdog would restart
-    the old model if the tray merely killed the children.
-    """
+    the old model if the app merely killed the servers."""
     def __init__(self, cfg):
         self.cfg = cfg
-        self.deleted_path = cfg.ollmlx_home / "deleted-models.json"
+        self.deleted_path = cfg.home / "deleted-models.json"
         self.deleted = self._load_deleted()
         self.models = [rid for rid, _size, downloading
                        in hf.scan_installed(cfg.hf_hub) if not downloading]
@@ -148,15 +154,12 @@ class StackController:
             blob = json.loads(self.deleted_path.read_text())
             return {model for model in blob.get("models", [])
                     if isinstance(model, str)}
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
             return set()
 
     def _save_deleted(self):
         try:
-            self.deleted_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.deleted_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"models": sorted(self.deleted)}))
-            tmp.replace(self.deleted_path)
+            write_json(self.deleted_path, {"models": sorted(self.deleted)})
         except OSError:
             pass
 
@@ -168,7 +171,7 @@ class StackController:
     def can_switch(self):
         return self.running or not monitor.port_ok(self.cfg.mlx_port)
 
-    def start(self, model, settings=None):
+    def start(self, model):
         with self.lock:
             if self.downloads and self.downloads.active(model):
                 return 409, {"error": "wait for the download to finish"}
@@ -180,10 +183,9 @@ class StackController:
                 return 409, {"error": "stop the terminal stack before switching"}
             if not self._stop():
                 return 409, {"error": "previous model is still stopping"}
-            env = os.environ.copy()
-            launch_settings = _safe_model_settings(
-                self.cfg, model, settings or self.cfg.model_settings(model))
-            env.update(self.cfg.model_environment(model, launch_settings))
+            settings = _safe_model_settings(self.cfg, model,
+                                            self.cfg.model_settings(model))
+            env = {**os.environ, **self.cfg.model_environment(model, settings)}
             self.proc = subprocess.Popen(
                 [sys.executable, "-m", "local_llm", "serve", model], env=env)
             self.current = model
@@ -203,10 +205,7 @@ class StackController:
                          in hf.scan_installed(self.cfg.hf_hub)}
             if model not in installed:
                 return 404, {"error": "model is not downloaded"}
-            procs = monitor.watch_procs(self.cfg.mlx_small_port, self.cfg.mlx_port)
-            loaded = _loaded_model(procs, monitor.port_ok(self.cfg.mlx_port),
-                                   self.cfg.mlx_port)
-            if loaded == model:
+            if _main_model(self.cfg) == model:
                 return 409, {"error": "stop the loaded model before deleting it"}
             try:
                 hf.delete_model(self.cfg.hf_hub, model)
@@ -250,7 +249,7 @@ class DownloadManager:
         self.on_change = on_change
         self.jobs = {}
         self.lock = threading.Lock()
-        self.state_path = cfg.ollmlx_home / "downloads.json"
+        self.state_path = cfg.home / "downloads.json"
         self.stopping = False
         self._resume()
 
@@ -263,7 +262,7 @@ class DownloadManager:
         return missing == []
 
     def _spawn(self, model):
-        env = os.environ.copy()
+        env = dict(os.environ)
         token = self.cfg.hf_token
         if token:
             env["HF_TOKEN"] = token
@@ -280,21 +279,17 @@ class DownloadManager:
         threading.Thread(target=self._run, args=(model,), daemon=True).start()
 
     def _save(self):
-        """Atomically persist every unfinished model; callers hold the lock
-        (except single-threaded startup). Failed jobs resume on next launch."""
+        """Persist every unfinished model; callers hold the lock (except
+        single-threaded startup). Failed jobs resume on next launch."""
         try:
-            self.cfg.ollmlx_home.mkdir(parents=True, exist_ok=True)
-            tmp = self.state_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"models": sorted(self.jobs)}))
-            tmp.replace(self.state_path)
+            write_json(self.state_path, {"models": sorted(self.jobs)})
         except OSError:
             pass
 
     def _resume(self):
         try:
-            blob = json.loads(self.state_path.read_text())
-            pending = blob.get("models", [])
-        except (OSError, ValueError):
+            pending = json.loads(self.state_path.read_text()).get("models", [])
+        except (OSError, ValueError, AttributeError):
             pending = []
         for model in pending:
             if not isinstance(model, str) or self._complete(model):
@@ -323,15 +318,12 @@ class DownloadManager:
     def _run(self, model):
         completed = False
         try:
-            try:
-                total, _names, _files = hf._repo_file_meta(model, self.cfg.hf_token)
-            except Exception:
-                total = 0
+            total = hf.repo_size(model, self.cfg.hf_token)
             with self.lock:
-                self.jobs[model]["total"] = total
+                if model in self.jobs:
+                    self.jobs[model]["total"] = total
             threading.Thread(target=self._watch, args=(model,), daemon=True).start()
-            proc = self.jobs[model]["proc"]
-            status = proc.wait()
+            status = self.jobs[model]["proc"].wait()
             complete = self._complete(model) if status == 0 else False
             with self.lock:
                 if model not in self.jobs:
@@ -340,17 +332,16 @@ class DownloadManager:
                     completed = True
                     self.jobs.pop(model, None)
                 elif status == 0:
-                    self.jobs[model]["active"] = False
-                    self.jobs[model]["error"] = "download finished with missing files; retry"
+                    self.jobs[model].update(active=False, error="download finished"
+                                            " with missing files; retry")
                 elif not self.stopping and not self.jobs[model].get("cancelled"):
-                    self.jobs[model]["active"] = False
-                    self.jobs[model]["error"] = f"download exited with status {status}"
+                    self.jobs[model].update(active=False, error=f"download exited"
+                                            f" with status {status}")
                 self._save()
         except BaseException as exc:
             with self.lock:
                 if model in self.jobs and not self.stopping:
-                    self.jobs[model]["active"] = False
-                    self.jobs[model]["error"] = str(exc)
+                    self.jobs[model].update(active=False, error=str(exc))
                     self._save()
         finally:
             self.on_change(model if completed else None)
@@ -399,8 +390,7 @@ class DownloadManager:
             proc = job.get("proc")
             if proc and proc.poll() is None:
                 proc.send_signal(signal.SIGSTOP)
-            job["paused"] = True
-            job["rate"] = 0.0
+            job.update(paused=True, rate=0.0)
             self._save()
             return 200, {"paused": model}
 
@@ -462,133 +452,89 @@ class DownloadManager:
             return self.jobs.get(model, {}).get("error")
 
 
-def _reclaimable_model_bytes(cfg):
-    main_up = monitor.port_ok(cfg.mlx_port)
-    if not main_up:
-        return 0
-    model = _loaded_model(monitor.watch_procs(cfg.mlx_small_port, cfg.mlx_port),
-                          True, cfg.mlx_port)
+# --- launch settings ---------------------------------------------------------------
+
+
+def _reclaimable_model_bytes(cfg) -> int:
+    """Disk size of the main model's weights while its port is up — what
+    unloading it frees."""
+    model = _main_model(cfg)
     return hf.model_disk_bytes(cfg.hf_hub, model) if model else 0
 
 
-def _safe_model_settings(cfg, model, values, reclaimable_bytes=0):
+def _unload_headroom(cfg, model, loaded) -> tuple[int, int]:
+    """(reclaimable, freed): the RAM that loading `model` sets free. A
+    different model evicts the loaded one, whose weights are up for grabs;
+    the loaded model itself only lends its own weights to its reload."""
+    if model == loaded:
+        return 0, hf.model_disk_bytes(cfg.hf_hub, model)
+    reclaimable = _reclaimable_model_bytes(cfg)
+    return reclaimable, reclaimable
+
+
+def _safe_model_settings(cfg, model, values, reclaimable_bytes=0,
+                         strict=False) -> dict:
+    """Launch settings clamped to what this machine can serve the model
+    with: the prompt cache inside free RAM after the weights and a reserve,
+    the context inside the KV budget. strict=True refuses a model that
+    cannot get a 4K context instead of clamping."""
     values = dict(values)
     values["temperature"] = min(1.0, values["temperature"])
     cache_limit = int(hf.memory_cache_limit(cfg.hf_hub, model, reclaimable_bytes) * 0.95)
+    values["prompt_cache_bytes"] = min(values["prompt_cache_bytes"], cache_limit)
     ram_limit = hf.memory_context_limit(cfg.hf_hub, model, reclaimable_bytes,
                                         values["prompt_cache_bytes"], values["kv_bits"])
-    values["prompt_cache_bytes"] = min(values["prompt_cache_bytes"], cache_limit)
     if ram_limit is not None:
+        if strict and ram_limit < 4096:
+            raise ValueError("not enough available RAM for this model")
         values["max_ctx"] = min(values["max_ctx"], max(4096, ram_limit))
     values["max_tokens"] = min(
         values["max_tokens"],
-        hf.safe_context(cfg.hf_hub, model, values["prompt_cache_bytes"], values["max_ctx"],
-                        reclaimable_bytes, values["kv_bits"]))
+        hf.safe_context(cfg.hf_hub, model, values["prompt_cache_bytes"],
+                        values["max_ctx"], reclaimable_bytes, values["kv_bits"]))
     return values
 
 
-def _context_settings(cfg, model=None):
-    defaults = {name: getattr(cfg, name) for name in (
-        "max_ctx", "prompt_cache_bytes", "kv_bits", "kv_group_size",
-        "load_timeout", "client_timeout", "temperature", "top_p", "top_k",
-        "min_p", "max_tokens")}
-    values = cfg.model_settings(model) if model else dict(defaults)
-    main_up = monitor.port_ok(cfg.mlx_port)
-    loaded = _loaded_model(monitor.watch_procs(cfg.mlx_small_port, cfg.mlx_port),
-                           main_up, cfg.mlx_port) if main_up else None
-    subject = model or loaded
-    weights = hf.model_disk_bytes(cfg.hf_hub, subject) if subject else 0
-    reclaimable = 0 if model and model == loaded else _reclaimable_model_bytes(cfg)
-    calculation_reclaimable = reclaimable + (weights if subject and subject == loaded else 0)
-    if model:
-        values = _safe_model_settings(cfg, model, values, calculation_reclaimable)
-    kv = hf.model_kv_per_token(cfg.hf_hub, subject) if subject else None
+def _context_settings(cfg, model) -> dict:
+    """Launch settings of `model` for the app's form, with the memory
+    figures its forecast is drawn from."""
+    loaded = _main_model(cfg)
+    reclaimable, freed = _unload_headroom(cfg, model, loaded)
+    values = _safe_model_settings(cfg, model, cfg.model_settings(model), freed)
+    available = psutil.virtual_memory().available
     return {
         "settings": values,
-        "defaults": defaults,
-        "kv_bytes_per_token": kv,
-        "effective_ctx": (hf.safe_context(
-            cfg.hf_hub, subject, values["prompt_cache_bytes"], values["max_ctx"],
-            calculation_reclaimable, values["kv_bits"])
-            if subject else None),
-        "model_ctx": hf.model_ctx(cfg.hf_hub, subject) if subject else None,
-        "available_bytes": psutil.virtual_memory().available,
+        "defaults": {name: getattr(cfg, name) for name in SETTING_ENV},
+        "kv_bytes_per_token": hf.model_kv_per_token(cfg.hf_hub, model),
+        "effective_ctx": hf.safe_context(
+            cfg.hf_hub, model, values["prompt_cache_bytes"], values["max_ctx"],
+            freed, values["kv_bits"]),
+        "model_ctx": hf.model_ctx(cfg.hf_hub, model),
+        "available_bytes": available,
         "reclaimable_bytes": reclaimable,
-        "is_loaded": bool(model and model == loaded),
-        "budget_available_bytes": psutil.virtual_memory().available + reclaimable,
-        "weights_bytes": weights,
-        "cache_limit_bytes": hf.memory_cache_limit(cfg.hf_hub, subject, calculation_reclaimable) if subject else 0,
+        "is_loaded": model == loaded,
+        "budget_available_bytes": available + reclaimable,
+        "weights_bytes": hf.model_disk_bytes(cfg.hf_hub, model),
+        "cache_limit_bytes": hf.memory_cache_limit(cfg.hf_hub, model, freed),
     }
 
 
-def _update_context_settings(cfg, payload):
+def _update_context_settings(cfg, payload) -> None:
+    """Save the launch settings the app's form sent for a model."""
     model = payload.get("model")
-    if model:
-        try:
-            values = {name: int(payload[name]) for name in (
-                "max_ctx", "prompt_cache_bytes", "kv_bits", "kv_group_size",
-                "load_timeout", "client_timeout", "top_k", "max_tokens")}
-            for name in ("temperature", "top_p", "min_p"):
-                values[name] = float(payload[name])
-        except (KeyError, TypeError, ValueError):
-            raise ValueError("expected all model launch settings") from None
-        if not 0 <= values["temperature"] <= 1:
-            raise ValueError("temperature must be between 0 and 1")
-        if not 0 <= values["top_p"] <= 1 or not 0 <= values["min_p"] <= 1:
-            raise ValueError("top-p and min-p must be between 0 and 1")
-        if not 0 <= values["top_k"] <= 1024:
-            raise ValueError("top-k must be between 0 and 1024")
-        if not 256 <= values["max_tokens"] <= 262_144:
-            raise ValueError("max tokens must be between 256 and 262144")
-        if values["kv_bits"] not in (0, 4, 8):
-            raise ValueError("KV bits must be 0, 4 or 8")
-        if not 16 <= values["kv_group_size"] <= 1024:
-            raise ValueError("KV group size must be between 16 and 1024")
-        if values["load_timeout"] <= 0 or values["client_timeout"] <= 0:
-            raise ValueError("timeouts must be positive")
-        max_ctx = values["max_ctx"]
-        prompt_cache_bytes = values["prompt_cache_bytes"]
-    else:
-        try:
-            max_ctx = int(payload["max_ctx"])
-            prompt_cache_bytes = int(payload["prompt_cache_bytes"])
-        except (KeyError, TypeError, ValueError):
-            raise ValueError("expected max_ctx and prompt_cache_bytes") from None
-        values = None
-    if not 4096 <= max_ctx <= 262_144:
-        raise ValueError("context must be between 4K and 262K tokens")
-    if not 0 <= prompt_cache_bytes <= 512 * 1024**3:
-        raise ValueError("prompt cache must be between 0 and 512 GB")
-    if values is not None:
-        main_up = monitor.port_ok(cfg.mlx_port)
-        loaded = _loaded_model(monitor.watch_procs(cfg.mlx_small_port, cfg.mlx_port),
-                               main_up, cfg.mlx_port) if main_up else None
-        reclaimable = 0 if model and model == loaded else _reclaimable_model_bytes(cfg)
-        weights = hf.model_disk_bytes(cfg.hf_hub, model)
-        calculation_reclaimable = reclaimable + (weights if model == loaded else 0)
-        cache_limit = int(hf.memory_cache_limit(cfg.hf_hub, model, calculation_reclaimable) * 0.95)
-        values["prompt_cache_bytes"] = min(values["prompt_cache_bytes"], cache_limit)
-        ram_limit = hf.memory_context_limit(cfg.hf_hub, model, calculation_reclaimable,
-                                            values["prompt_cache_bytes"], values["kv_bits"])
-        if ram_limit is not None:
-            if ram_limit < 4096:
-                raise ValueError("not enough available RAM for this model")
-            values["max_ctx"] = min(values["max_ctx"], ram_limit)
-            values["max_tokens"] = min(
-                values["max_tokens"],
-                hf.safe_context(cfg.hf_hub, model, values["prompt_cache_bytes"], values["max_ctx"],
-                                calculation_reclaimable, values["kv_bits"]))
-    if values is None:
-        cfg.max_ctx = max_ctx
-        cfg.prompt_cache_bytes = prompt_cache_bytes
-        cfg.save_context()
-    else:
-        cfg.save_model_settings(model, values)
+    if not isinstance(model, str) or not model:
+        raise ValueError("expected a model name")
+    _reclaimable, freed = _unload_headroom(cfg, model, _main_model(cfg))
+    values = _safe_model_settings(cfg, model, launch_settings_from(payload),
+                                  freed, strict=True)
+    cfg.save_model_settings(model, values)
 
 
-def snapshot(cfg, controller=None) -> dict:
-    """One UI-independent monitor sample; all values are JSON primitives."""
-    _, max_input = _client_state()
+# --- monitor snapshot --------------------------------------------------------------
+
+
+def snapshot(cfg, controller) -> dict:
+    """One monitor sample; all values are JSON primitives."""
     backend = _backend()
     main_log = servers.LLAMA_LOG if backend == "llama" else servers.MLX_LOG
     main_up = monitor.port_ok(cfg.mlx_port)
@@ -603,7 +549,7 @@ def snapshot(cfg, controller=None) -> dict:
         try:
             rss = p.memory_info().rss
             ours += rss
-            if name in ("mlx_lm.server", "llama") and main_up:
+            if name != "mlx-small" and main_up:
                 uptime = max(uptime, int(time.time() - p.create_time()))
             rows.append({"name": name, "pid": p.pid,
                          "cpu": p.cpu_percent(), "rss": rss,
@@ -614,13 +560,11 @@ def snapshot(cfg, controller=None) -> dict:
     model = _loaded_model(procs, main_up, cfg.mlx_port) or "no model loaded"
     small_model = (_loaded_model(procs, small_up, cfg.mlx_small_port, helper=True)
                    if small_up else None)
-    request_tracker = controller.request_tracker if controller else None
     launch_error = None
-    if controller and controller.proc is not None and not main_up:
+    if controller.proc is not None and not main_up:
         status = controller.proc.poll()
         if status is not None and controller.current:
             launch_error = {"model": controller.current, "status": status}
-    eaters = monitor.top_eaters(3, {p.pid for _, p in procs})
     logs = [(tag, line) for tag, path in (
                 (backend, main_log), ("proxy", servers.PROXY_LOG),
                 ("mlx-small", servers.MLX_SMALL_LOG),
@@ -632,21 +576,16 @@ def snapshot(cfg, controller=None) -> dict:
                  for tag, path in ((backend, main_log),
                                    ("proxy", servers.PROXY_LOG))
                  for text in monitor.tail_lines(path, 100)]
-    client_settings = clients.client_configs(cfg)
-    available_models = controller.models if controller else []
-    if controller and controller.downloads:
-        available_models = [model for model in available_models
-                            if not controller.downloads.active(model)]
     return {
         "model": model,
         "small_model": small_model,
         "launch_error": launch_error,
         "backend": backend,
         "uptime_seconds": uptime,
-        "max_input": max_input,
-        "config_home": str(cfg.ollmlx_home),
-        "available_models": controller.models if controller else [],
-        "can_switch": controller.can_switch if controller else False,
+        "max_input": _advertised_context(cfg),
+        "config_home": str(cfg.home),
+        "available_models": controller.models,
+        "can_switch": controller.can_switch,
         "ports": {
             "main": {"label": backend, "port": cfg.mlx_port, "up": main_up},
             "small": ({"label": "small", "port": cfg.mlx_small_port,
@@ -665,19 +604,21 @@ def snapshot(cfg, controller=None) -> dict:
             "ours_percent": ours / vm.total * 100,
         },
         "top_eaters": [{"name": name, "pid": pid, "rss": rss}
-                       for rss, pid, name in eaters],
-        "main": _perf(main_log, request_tracker),
-        "small": _perf(servers.MLX_SMALL_LOG, request_tracker) if small_up else None,
-        "clients": client_settings,
+                       for rss, pid, name in
+                       monitor.top_eaters(3, {p.pid for _, p in procs})],
+        "main": _perf(main_log, controller.request_tracker),
+        "small": (_perf(servers.MLX_SMALL_LOG, controller.request_tracker)
+                  if small_up else None),
+        "clients": clients.client_configs(cfg),
         "logs": log_rows,
     }
 
 
-def _make_server(cfg, controller=None):
-    """Bind the snapshot API before launching the native window."""
-    controller = controller or StackController(cfg)
-    downloads = DownloadManager(cfg, controller.refresh_models)
-    controller.downloads = downloads
+# --- the HTTP server ---------------------------------------------------------------
+
+
+def _make_server(cfg, controller, downloads) -> ThreadingHTTPServer:
+    """Bind the local API before the native window asks for its first snapshot."""
     catalog = ModelCatalog(cfg, downloads, controller.deleted)
 
     class Handler(BaseHTTPRequestHandler):
@@ -690,22 +631,38 @@ def _make_server(cfg, controller=None):
             self.end_headers()
             self.wfile.write(body)
 
+        def _trusted(self) -> bool:
+            """Only a program on this machine gets an answer: the app's
+            URLSession addresses 127.0.0.1 and sends no Origin, a web page
+            does one or the other (see net.py)."""
+            if (not loopback_host(self.headers, self.server.server_address[1])
+                    or from_web_page(self.headers)):
+                self.reply(403, {"error": "the local API only answers programs"
+                                         " on this machine"})
+                return False
+            return True
+
         def do_GET(self):
-            parsed = urllib.parse.urlsplit(self.path)
-            if parsed.path == "/snapshot":
+            if not self._trusted():
+                return
+            url = urllib.parse.urlsplit(self.path)
+            if url.path == "/snapshot":
                 self.reply(200, snapshot(cfg, controller))
-                return
-            if parsed.path == "/downloads":
+            elif url.path == "/downloads":
                 self.reply(200, downloads.all_progress())
-                return
-            if parsed.path == "/settings":
-                model = urllib.parse.parse_qs(parsed.query).get("model", [None])[0]
-                self.reply(200, _context_settings(cfg, model))
-                return
-            if parsed.path != "/models":
+            elif url.path == "/settings":
+                model = urllib.parse.parse_qs(url.query).get("model", [None])[0]
+                if model:
+                    self.reply(200, _context_settings(cfg, model))
+                else:
+                    self.reply(400, {"error": "expected a model name"})
+            elif url.path == "/models":
+                self._models(url.query)
+            else:
                 self.send_error(404)
-                return
-            params = urllib.parse.parse_qs(parsed.query)
+
+        def _models(self, query):
+            params = urllib.parse.parse_qs(query)
 
             def arg(name, default):
                 return params.get(name, [default])[0]
@@ -719,15 +676,17 @@ def _make_server(cfg, controller=None):
                     local_only=arg("local_only", "0") == "1")
             except ValueError as exc:
                 self.reply(400, {"error": str(exc)})
-                return
             except Exception as exc:
                 applog.log.exception("model catalog failed")
                 self.reply(500, {"error": str(exc)})
-                return
-            self.reply(200, result)
+            else:
+                self.reply(200, result)
 
         def do_POST(self):
-            if self.path not in ("/run", "/delete", "/download", "/pause", "/resume", "/cancel", "/settings", "/stop"):
+            if not self._trusted():
+                return
+            if self.path not in ("/run", "/delete", "/download", "/pause",
+                                 "/resume", "/cancel", "/settings", "/stop"):
                 self.send_error(404)
                 return
             try:
@@ -735,22 +694,23 @@ def _make_server(cfg, controller=None):
                 if size > 4096:
                     raise ValueError
                 payload = json.loads(self.rfile.read(size))
-            except (ValueError, json.JSONDecodeError):
+                if not isinstance(payload, dict):
+                    raise ValueError
+            except ValueError:
+                self.close_connection = True   # the body was not read to the end
                 self.reply(400, {"error": "invalid JSON"})
                 return
+            model = payload.get("model")
             if self.path == "/settings":
                 try:
                     _update_context_settings(cfg, payload)
                 except ValueError as exc:
                     self.reply(400, {"error": str(exc)})
                     return
-                self.reply(200, _context_settings(cfg, payload.get("model")))
-                return
-            model = payload.get("model")
-            if not isinstance(model, str):
+                self.reply(200, _context_settings(cfg, model))
+            elif not isinstance(model, str):
                 self.reply(400, {"error": "expected a model name"})
-                return
-            if self.path == "/run":
+            elif self.path == "/run":
                 self.reply(*controller.start(model))
             elif self.path == "/delete":
                 self.reply(*controller.delete(model))
@@ -769,9 +729,7 @@ def _make_server(cfg, controller=None):
             pass
 
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", cfg.widget_port), Handler)
-        server.downloads = downloads
-        return server
+        return ThreadingHTTPServer((HOST, cfg.widget_port), Handler)
     except OSError:
         raise SystemExit(f"   widget port :{cfg.widget_port} is in use"
                          " — set WIDGET_PORT to a free port") from None
@@ -781,13 +739,15 @@ def run_api(cfg) -> int:
     """Foreground API child of MLX Stack.app; SIGTERM also stops its model."""
     applog.setup()
     controller = StackController(cfg)
-    server = _make_server(cfg, controller)
+    downloads = DownloadManager(cfg, controller.refresh_models)
+    controller.downloads = downloads
+    server = _make_server(cfg, controller, downloads)
     parent = os.getppid()
 
     def watch_parent():
         # A killed/crashed app cannot run applicationWillTerminate. Once
         # launchd adopts us, keeping the API alive would leave a headless
-        # model and a mystery Python process with no tray icon.
+        # model and a mystery Python process with no status-bar icon.
         while os.getppid() == parent:
             time.sleep(1)
         server.shutdown()
@@ -799,7 +759,7 @@ def run_api(cfg) -> int:
         return 0
     finally:
         server.server_close()
-        server.downloads.stop()
+        downloads.stop()
         controller.stop()
 
 

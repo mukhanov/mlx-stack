@@ -4,6 +4,46 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+# Launch settings of a model and the environment variable that carries each
+# one into `local-llm serve`: the app sets them for the model it loads, a
+# terminal inherits them from the shell.
+SETTING_ENV = {
+    "max_ctx": "MLX_MAX_CTX",
+    "prompt_cache_bytes": "MLX_PROMPT_CACHE_BYTES",
+    "kv_bits": "MLX_KV_BITS",
+    "kv_group_size": "MLX_KV_GROUP_SIZE",
+    "load_timeout": "LOAD_TIMEOUT",
+    "client_timeout": "CLIENT_TIMEOUT",
+    "temperature": "OLLMLX_TEMP",
+    "top_p": "OLLMLX_TOP_P",
+    "top_k": "OLLMLX_TOP_K",
+    "min_p": "OLLMLX_MIN_P",
+    "max_tokens": "OLLMLX_MAX_TOKENS",
+}
+FLOAT_SETTINGS = ("temperature", "top_p", "min_p")
+
+# What clients call the two model servers; the proxy maps these to the
+# models that are actually loaded.
+LOCAL_ALIAS = "local"         # what clients call the main model
+SMALL_ALIAS = "small"         # what clients call the helper model
+
+# setting -> accepted range, in the order the app's form is checked. The
+# first element is the lowest value, or the few values that are allowed.
+_SETTING_LIMITS = (
+    ("temperature", 0, 1, "temperature must be between 0 and 1"),
+    ("top_p", 0, 1, "top-p and min-p must be between 0 and 1"),
+    ("min_p", 0, 1, "top-p and min-p must be between 0 and 1"),
+    ("top_k", 0, 1024, "top-k must be between 0 and 1024"),
+    ("max_tokens", 256, 262_144, "max tokens must be between 256 and 262144"),
+    ("kv_bits", (0, 4, 8), None, "KV bits must be 0, 4 or 8"),
+    ("kv_group_size", 16, 1024, "KV group size must be between 16 and 1024"),
+    ("load_timeout", 1, None, "timeouts must be positive"),
+    ("client_timeout", 1, None, "timeouts must be positive"),
+    ("max_ctx", 4096, 262_144, "context must be between 4K and 262K tokens"),
+    ("prompt_cache_bytes", 0, 512 * 1024**3,
+     "prompt cache must be between 0 and 512 GB"),
+)
+
 
 def stack_home() -> Path:
     """Canonical application home; OLLMLX_HOME remains a legacy override."""
@@ -12,9 +52,34 @@ def stack_home() -> Path:
                 or "~/.mlx-stack").expanduser()
 
 
+def write_json(path: Path, data) -> None:
+    """Replace the file atomically: nothing ever reads a half-written one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, sort_keys=True))
+    tmp.replace(path)
+
+
+def launch_settings_from(payload: dict) -> dict:
+    """Launch settings as the app's form sends them. ValueError names the
+    first value that is missing or out of range."""
+    try:
+        values = {name: float(payload[name]) if name in FLOAT_SETTINGS
+                  else int(payload[name]) for name in SETTING_ENV}
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("expected all model launch settings") from None
+    for name, low, high, message in _SETTING_LIMITS:
+        value = values[name]
+        allowed = value in low if isinstance(low, tuple) else (
+            low <= value and (high is None or value <= high))
+        if not allowed:
+            raise ValueError(message)
+    return values
+
+
 @dataclass
 class Config:
-    ollmlx_home: Path
+    home: Path
     hf_hub: Path
     mlx_port: int
     proxy_port: int
@@ -62,7 +127,7 @@ class Config:
 
     @property
     def claude_cfg(self) -> Path:
-        return self.ollmlx_home / "configs" / "claude.json"
+        return self.home / "configs" / "claude.json"
 
     # HF token for gated models and higher API limits: env takes precedence,
     # fallback is the private file ~/.mlx-stack/hf-token (set via `local-llm token`).
@@ -72,77 +137,47 @@ class Config:
         if env and env.strip():
             return env.strip()
         try:
-            t = (self.ollmlx_home / "hf-token").read_text().strip()
-            return t or None
+            token = (self.home / "hf-token").read_text().strip()
+            return token or None
         except OSError:
             return None
 
-    def model_settings(self, model):
-        values = {name: getattr(self, name) for name in (
-            "max_ctx", "prompt_cache_bytes", "kv_bits", "kv_group_size",
-            "load_timeout", "client_timeout", "temperature", "top_p", "top_k",
-            "min_p", "max_tokens")}
+    def model_settings(self, model: str) -> dict:
+        """The model's launch settings: the stack-wide values, overridden by
+        what is saved for it."""
+        values = {name: getattr(self, name) for name in SETTING_ENV}
         try:
-            blob = json.loads((self.ollmlx_home / "model-settings.json").read_text())
-            values.update(blob.get(model, {}))
-        except (OSError, ValueError):
+            saved = json.loads((self.home / "model-settings.json").read_text())
+            values.update(saved.get(model) or {})
+        except (OSError, ValueError, AttributeError):
             pass
-        values["temperature"] = min(1.0, float(values["temperature"]))
         return values
 
-    def save_model_settings(self, model, values):
-        path = self.ollmlx_home / "model-settings.json"
+    def save_model_settings(self, model: str, values: dict) -> None:
+        path = self.home / "model-settings.json"
         try:
-            blob = json.loads(path.read_text())
+            saved = json.loads(path.read_text())
         except (OSError, ValueError):
-            blob = {}
-        allowed = ("max_ctx", "prompt_cache_bytes", "kv_bits", "kv_group_size",
-                   "load_timeout", "client_timeout", "temperature", "top_p",
-                   "top_k", "min_p", "max_tokens")
-        blob[model] = {name: values[name] for name in allowed}
-        self.ollmlx_home.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(blob, sort_keys=True))
-        tmp.replace(path)
+            saved = {}
+        saved[model] = {name: values[name] for name in SETTING_ENV}
+        write_json(path, saved)
 
-    def model_environment(self, model, values=None):
-        values = values or self.model_settings(model)
-        return {
-            "MLX_MAX_CTX": str(values["max_ctx"]),
-            "MLX_PROMPT_CACHE_BYTES": str(values["prompt_cache_bytes"]),
-            "MLX_KV_BITS": str(values["kv_bits"]),
-            "MLX_KV_GROUP_SIZE": str(values["kv_group_size"]),
-            "LOAD_TIMEOUT": str(values["load_timeout"]),
-            "CLIENT_TIMEOUT": str(values["client_timeout"]),
-            "OLLMLX_TEMP": str(values["temperature"]),
-            "OLLMLX_TOP_P": str(values["top_p"]),
-            "OLLMLX_TOP_K": str(values["top_k"]),
-            "OLLMLX_MIN_P": str(values["min_p"]),
-            "OLLMLX_MAX_TOKENS": str(values["max_tokens"]),
-        }
-
-    def save_context(self):
-        path = self.ollmlx_home / "context-settings.json"
-        tmp = path.with_suffix(".tmp")
-        self.ollmlx_home.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps({"max_ctx": self.max_ctx,
-                                   "prompt_cache_bytes": self.prompt_cache_bytes}))
-        tmp.replace(path)
+    def model_environment(self, model: str, values: dict | None = None) -> dict[str, str]:
+        """The model's launch settings as the environment of `local_llm serve`."""
+        values = values if values is not None else self.model_settings(model)
+        return {env: str(values[name]) for name, env in SETTING_ENV.items()}
 
     @classmethod
     def from_env(cls) -> "Config":
         home = stack_home()
-        home.mkdir(parents=True, exist_ok=True)
         (home / "configs").mkdir(parents=True, exist_ok=True)
         try:
-            overrides = json.loads((home / "context-settings.json").read_text())
+            # stack-wide context and prompt-cache limits saved by older versions
+            saved = json.loads((home / "context-settings.json").read_text())
         except (OSError, ValueError):
-            overrides = {}
-        max_ctx = int(os.environ.get("MLX_MAX_CTX", overrides.get("max_ctx", "110000")))
-        prompt_cache_bytes = int(os.environ.get(
-            "MLX_PROMPT_CACHE_BYTES", overrides.get("prompt_cache_bytes", str(16 * 1024**3))))
+            saved = {}
         return cls(
-            ollmlx_home=home,
+            home=home,
             hf_hub=Path(
                 os.environ.get("HF_HUB_CACHE", "~/.cache/huggingface/hub")
             ).expanduser(),
@@ -155,10 +190,11 @@ class Config:
             mlx_small_port=int(os.environ.get("MLX_SMALL_PORT", "8081")),
             kv_bits=int(os.environ.get("MLX_KV_BITS", "0")),
             kv_group_size=int(os.environ.get("MLX_KV_GROUP_SIZE", "64")),
-            prompt_cache_bytes=prompt_cache_bytes,
+            prompt_cache_bytes=int(os.environ.get(
+                "MLX_PROMPT_CACHE_BYTES", saved.get("prompt_cache_bytes", 16 * 1024**3))),
             load_timeout=int(os.environ.get("LOAD_TIMEOUT", "900")),
             client_timeout=int(os.environ.get("CLIENT_TIMEOUT", "1800")),
-            max_ctx=max_ctx,
+            max_ctx=int(os.environ.get("MLX_MAX_CTX", saved.get("max_ctx", 110_000))),
             temperature=float(os.environ.get("OLLMLX_TEMP", "0.0")),
             top_p=float(os.environ.get("OLLMLX_TOP_P", "1.0")),
             top_k=int(os.environ.get("OLLMLX_TOP_K", "0")),

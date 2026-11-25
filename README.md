@@ -13,7 +13,7 @@ flowchart LR
     W -.-> S
 ```
 
-All four services bind to `127.0.0.1` only.
+All four services bind to `127.0.0.1` only. The local API and the client proxy also answer a request only when it addresses this machine by name and does not come from a web page, so a site open in a browser cannot load, stop or delete models through them. The two model servers take no key: any program run by your user can call them on their ports.
 
 ## Install
 
@@ -27,6 +27,8 @@ open -a "MLX Stack"
 The cask puts `MLX Stack.app` in `/Applications`. The backend and `uv` travel inside the bundle; no Python installation or terminal setup is needed.
 
 On first launch the app creates `~/.mlx-stack/mlx-stack-venv` and installs the backend's Python dependencies, which needs internet access once. An existing `~/.ollmlx` is migrated to `~/.mlx-stack` and kept as a compatibility symlink.
+
+The backend needs three Python packages — `mlx-lm`, `huggingface-hub` and `psutil` — and otherwise only the standard library. GGUF models fetch a `llama-server` build on first use.
 
 ## Models
 
@@ -89,9 +91,10 @@ The same backend runs headless from `Backend/local-llm`:
 |---|---|
 | `serve <org/model> [quant]` | Start a model in the foreground; Ctrl-C or SIGTERM stops it |
 | `list` | Downloaded models with size and RAM estimate |
-| `stop` | Kill servers left over from an earlier run |
+| `stop` | Stop the model servers an interrupted run left on the stack's ports; model servers on other ports are left alone |
 | `rm [org/repo…]` | Delete downloaded models; prompts when called without arguments |
 | `token [hf_… \| --clear]` | Show, save or clear the Hugging Face token |
+| `widget` | Open MLX Stack.app |
 
 Ports and limits are set with environment variables. In the app, the launch parameters chosen in Models take precedence.
 
@@ -105,6 +108,9 @@ Ports and limits are set with environment variables. In the app, the launch para
 | `MLX_PROMPT_CACHE_BYTES` | `17179869184` | Prompt cache limit, `0` disables it |
 | `MLX_KV_BITS`, `MLX_KV_GROUP_SIZE` | `0`, `64` | KV-cache quantization, `0` disables it |
 | `LOAD_TIMEOUT`, `CLIENT_TIMEOUT` | `900`, `1800` | Seconds to wait for the weights; budget per request |
+| `OLLMLX_TEMP`, `OLLMLX_TOP_P`, `OLLMLX_TOP_K`, `OLLMLX_MIN_P` | `0.0`, `1.0`, `0`, `0.0` | Sampling defaults of the model server |
+| `OLLMLX_MAX_TOKENS` | `32768` | Longest answer, in tokens |
+| `OLLMLX_SMALL_MODEL`, `OLLMLX_LLAMA_SERVER` | | Helper model; path to a `llama-server` binary |
 | `MLX_STACK_HOME` | `~/.mlx-stack` | Settings, configuration and logs |
 
 ## Files

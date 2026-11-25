@@ -1,14 +1,11 @@
 """Persistent application log: ~/.mlx-stack/logs/app.log (rotating).
 
-The app used to leave nothing behind on a crash: its own exceptions went
-to the terminal (gone), and the server logs lived in /tmp (wiped by
-macOS on reboot). Now every run opens with a header line, lifecycle
-events are logged (server starts, readiness, watchdog restarts, monitor
-exit), and anything that would kill the process — an uncaught exception
-in the main thread or in a background thread (watchdog, stack-start), or
-SIGTERM/SIGHUP — is written here with a full traceback before the
-process dies. The server children keep their own logs next to this file
-(servers.py moved them out of /tmp for the same reason)."""
+Every run opens with a header line, lifecycle events are logged (server
+starts, readiness, watchdog restarts), and anything that would kill the
+process — an uncaught exception in the main thread or in a background
+thread (watchdog, stack start), or SIGTERM/SIGHUP — is written here with a
+full traceback before the process dies. The server children keep their own
+logs next to this file (see servers.py)."""
 import logging
 import logging.handlers
 import os
@@ -55,14 +52,14 @@ def setup() -> Path | None:
             root.setLevel(logging.INFO)
             root.addHandler(handler)
         except OSError:
-            # an unwritable OLLMLX_HOME must not brick the app — crash
-            # hooks below still fire (via logging's lastResort -> stderr)
+            # an unwritable home must not brick the app — the crash hooks
+            # below still fire (via logging's lastResort -> stderr)
             path = None
 
         prev_hook = sys.excepthook
 
         def _excepthook(tp, exc, tb):
-            # KeyboardInterrupt is the normal q/Ctrl-C exit — no drama
+            # Ctrl-C is the normal exit from a terminal — no drama
             if tp is not KeyboardInterrupt:
                 log.critical("uncaught exception — app dies",
                              exc_info=(tp, exc, tb))

@@ -1,10 +1,10 @@
-"""Lifecycle of mlx_lm.server (:19797, OpenAI) and the client proxy (:4000,
-OpenAI + Anthropic bridge): start, readiness wait, warmup, stop, plus a
-watchdog that restarts mlx after a crash or the post-OOM zombie.
+"""Lifecycle of the model servers and the client proxy: start, readiness
+wait, warmup, stop, and the watchdog that restarts a crashed model server.
 
-The servers run as foreground children of our process (no nohup/daemons):
-stopping the stack (SIGTERM, SIGHUP or Ctrl-C) kills everything at once
-(see cli.run_serve)."""
+The model servers (mlx_lm.server or llama-server on :19797, the helper on
+:8081) are foreground children of the stack controller and the client proxy
+(:4000) is a thread of it — no daemons: stopping the controller (SIGTERM,
+SIGHUP or Ctrl-C) kills everything at once (see cli.run_serve)."""
 import hashlib
 import json
 import os
@@ -16,33 +16,29 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
+from functools import cache
 
-from . import hf, proxy, ui
+from . import hf, monitor, proxy, ui
 from .applog import log, logs_dir
+from .config import LOCAL_ALIAS
+from .net import HOST
 
-_LOGS = logs_dir()   # persistent: /tmp is wiped on reboot, taking the
-# evidence of a crash with it — ~/.mlx-stack/logs survives
+_LOGS = logs_dir()   # ~/.mlx-stack/logs survives a reboot; /tmp does not
 MLX_LOG = str(_LOGS / "mlx-server.log")
 MLX_SMALL_LOG = str(_LOGS / "mlx-small.log")
 LLAMA_LOG = str(_LOGS / "llama-server.log")
 PROXY_LOG = str(_LOGS / "proxy.log")
 WATCHDOG_LOG = str(_LOGS / "mlx-watchdog.log")
 
-# Popen handles of live children — killed in stop_children()
+# The watchdog probes the model server this often; LOOP_MAX restarts within
+# LOOP_WINDOW mean the client session is too big for this machine.
+PROBE_INTERVAL = 45.0
+LOOP_WINDOW = 600.0
+LOOP_MAX = 3
+BACKOFF = 600.0
+
+# Model servers this controller started, oldest first; stop_children() ends them.
 children: list[subprocess.Popen] = []
-
-
-# our wrapper around mlx_lm.server (tok/s logging) or a raw server from an
-# older local-llm — `stop` must kill either
-_MLX_PATTERN = r"local_llm\.mlxwrap|mlx_lm\.server"
-
-
-def _llama_pattern(port: int) -> str:
-    """Match string for OUR llama-server child. The port is part of the
-    pattern on purpose: `pkill -f llama-server` alone would take down an
-    unrelated llama-server the user runs for something else."""
-    return rf"llama-server.*--port {port}"
 
 
 def http_ok(url: str, timeout: float = 2.0) -> bool:
@@ -51,21 +47,6 @@ def http_ok(url: str, timeout: float = 2.0) -> bool:
             return r.status == 200
     except (OSError, urllib.error.URLError):
         return False
-
-
-def tail(path: str, n: int = 30):
-    try:
-        size = Path(path).stat().st_size
-        with open(path, "rb") as f:
-            f.seek(max(0, size - 65536))
-            return f.read().decode("utf-8", "replace").splitlines()[-n:]
-    except OSError:
-        return []
-
-
-def _pkill(pattern: str) -> bool:
-    return subprocess.run(["pkill", "-f", pattern],
-                          capture_output=True).returncode == 0
 
 
 def _open_log(path: str):
@@ -79,31 +60,53 @@ def _open_log(path: str):
     return open(path, "wb")
 
 
-def stop_all(llama_port: int = 0) -> None:
-    """For `local-llm stop`: kill processes leaked from a previous run."""
-    ui.info("Stopping servers")
-    ui.ok("mlx_lm.server stopped" if _pkill(_MLX_PATTERN)
-          else "mlx_lm.server not running")
-    if llama_port:
-        ui.ok("llama-server stopped" if _pkill(_llama_pattern(llama_port))
-              else "llama-server not running")
+# --- stopping ---------------------------------------------------------------------
+
+
+def _pkill(pattern: str) -> bool:
+    return subprocess.run(["pkill", "-f", pattern],
+                          capture_output=True).returncode == 0
+
+
+def stale_server_pattern(port: int) -> str:
+    """pkill pattern of a server of this stack listening on `port`. The
+    port is part of the pattern on purpose: a model server the user runs
+    for something else, on another port, must survive."""
+    return rf"(local_llm\.mlxwrap|mlx_lm\.server|llama-server).*--port {port}( |$)"
+
+
+def stop_stale(cfg) -> bool:
+    """Kill what a hard-killed controller left on our ports. True when
+    there was anything."""
+    found = False
+    for port in (cfg.mlx_port, cfg.mlx_small_port):
+        found = _pkill(stale_server_pattern(port)) or found
+    if found:
+        time.sleep(1)   # the port is released as the process goes down
+    return found
+
+
+def _stop(proc) -> None:
+    """End one of our servers: SIGTERM, then SIGKILL if it ignores that."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def stop_children() -> None:
-    for p in children:
-        if p.poll() is None:
-            p.terminate()
-    for p in children:
-        try:
-            p.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            p.kill()
+    for proc in children:
+        _stop(proc)
+    children.clear()
 
 
-# --- watchdog --------------------------------------------------------------------
+# --- watchdog ----------------------------------------------------------------------
 #
-# mlx dies in two ways: the process exits, or a Metal OOM kills the
-# generation thread while the HTTP server lives on — the post-OOM zombie
+# The model server dies in two ways: the process exits, or a Metal OOM kills
+# the generation thread while the HTTP server lives on — the post-OOM zombie
 # (seen 2026-10-05 23:58 with a 186k-token session): /v1/models keeps
 # answering 200 and every completion 404s until restarted. The watchdog
 # catches both and brings the model back without user intervention.
@@ -113,7 +116,7 @@ _watchdog_stop = threading.Event()
 
 def _note(msg: str) -> None:
     """An event line in the watchdog's own log — the monitor tails it.
-    NOT the mlx log: the server child holds that file at its own non-append
+    NOT the model log: the server child holds that file at its own non-append
     offset and overwrites whatever anyone else appends after it (the
     13:19:35 restart note was lost exactly this way)."""
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -130,7 +133,7 @@ def _probe_generation(port: int, model: str, timeout: float = 30.0) -> str:
     /v1/models (that one stays 200 in the zombie state). 'busy' = no
     answer in time: mid-prefill of a huge prompt, not proof of anything."""
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/v1/chat/completions",
+        f"http://{HOST}:{port}/v1/chat/completions",
         data=json.dumps({"model": model, "max_tokens": 1, "stream": False,
                          "messages": [{"role": "user", "content": "ping"}]}
                         ).encode(),
@@ -145,33 +148,28 @@ def _probe_generation(port: int, model: str, timeout: float = 30.0) -> str:
         return "busy"
 
 
-def supervise(cfg, model: str, state: dict, interval: float = 45.0,
-              loop_window: float = 600.0, loop_max: int = 3,
-              backoff: float = 600.0,
-              max_input: int | None = None) -> None:
+def supervise(cfg, model: str, state: dict, max_input: int | None = None) -> None:
     """Start the watchdog thread. `state` = {"big": Popen, "small": Popen|None,
     "backend": "mlx"|"llama", ...}; on a dead process or 2 consecutive bad
     probes it restarts the model server(s) in place — the client proxy and
     the client configs keep pointing at the same ports, so clients just see a
     pause.
 
-    loop_max restarts within loop_window = the client session is bigger
-    than this machine can serve (every restart the client resends its full
-    context and the model OOMs again) — probing slows to `backoff` and a
-    note in the watchdog log says to compact the session. Restarts never
-    stop; when the window drains, normal cadence resumes."""
+    LOOP_MAX restarts within LOOP_WINDOW = the client session is bigger than
+    this machine can serve (every restart the client resends its full context
+    and the model OOMs again) — probing slows to BACKOFF and a note in the
+    watchdog log says to compact the session. Restarts never stop; when the
+    window drains, the normal cadence resumes."""
     _watchdog_stop.clear()
     restarts: list[float] = []
 
     def restart(reason: str) -> None:
-        llama = state.get("backend") == "llama"
-        if llama:
-            # only our llama-server (the port keeps unrelated ones alive);
-            # the MLX helper is a separate child and stays up
-            _pkill(_llama_pattern(cfg.mlx_port))
-        else:
-            _pkill(_MLX_PATTERN)   # takes the helper down too; it comes back
-        time.sleep(1)
+        llama = state["backend"] == "llama"
+        _stop(state["big"])
+        if not llama and state["small"] is not None:
+            # both load onto the same Metal device: the helper goes down with
+            # the big model and comes back with it
+            _stop(state["small"])
         try:
             state["big"] = (start_llama(cfg, state["gguf_path"], model,
                                         max_input, state.get("lora_path"))
@@ -181,16 +179,16 @@ def supervise(cfg, model: str, state: dict, interval: float = 45.0,
                 state["small"] = start_mlx_small(cfg)
             _note(f"{'llama-server' if llama else 'mlx'} restarted"
                   f" ({reason}) — stack healthy again")
-        except SystemExit as exc:
+        except (SystemExit, OSError) as exc:
             _note(f"restart failed ({reason}): {exc}")
 
     def run():
         bad = 0
-        iv = interval
+        interval = PROBE_INTERVAL
         loop_mode = False
-        while not _watchdog_stop.wait(iv):
+        while not _watchdog_stop.wait(interval):
             now = time.monotonic()
-            while restarts and now - restarts[0] > loop_window:
+            while restarts and now - restarts[0] > LOOP_WINDOW:
                 restarts.pop(0)
 
             big = state.get("big")
@@ -209,19 +207,19 @@ def supervise(cfg, model: str, state: dict, interval: float = 45.0,
                           f"{big.returncode if big is not None else '?'})")
 
             restarts.append(now)
-            if len(restarts) >= loop_max and not loop_mode:
+            if len(restarts) >= LOOP_MAX and not loop_mode:
                 loop_mode = True
-                iv = backoff
-                _note(f"{len(restarts)} restarts in {loop_window / 60:.0f} min —"
+                interval = BACKOFF
+                _note(f"{len(restarts)} restarts in {LOOP_WINDOW / 60:.0f} min —"
                       " the client session is likely too big for this machine:"
                       " compact it (/compact) or start a fresh one. Backing off"
-                      f" to a probe every {backoff / 60:.0f} min; restarts"
+                      f" to a probe every {BACKOFF / 60:.0f} min; restarts"
                       " continue")
             restart(reason)
             bad = 0
-            if loop_mode and len(restarts) < loop_max:
+            if loop_mode and len(restarts) < LOOP_MAX:
                 loop_mode = False
-                iv = interval
+                interval = PROBE_INTERVAL
                 _note("no crashes in a while — back to normal probing")
 
     threading.Thread(target=run, daemon=True, name="mlx-watchdog").start()
@@ -233,8 +231,7 @@ def stop_watchdog() -> None:
     _watchdog_stop.set()
 
 
-_proxy_log = None
-_proxy_log_lock = threading.Lock()
+# --- starting ----------------------------------------------------------------------
 
 
 def start_proxy(cfg, model: str, small_ok: bool) -> None:
@@ -243,14 +240,14 @@ def start_proxy(cfg, model: str, small_ok: bool) -> None:
     requests and bridges Anthropic /v1/messages. Started before the model
     servers, so the port answers while they load and clients see a 503
     instead of a refused connection."""
-    global _proxy_log
     ui.info(f"Starting client proxy on :{cfg.proxy_port}")
-    _proxy_log = _open_log(PROXY_LOG)
+    access_log = _open_log(PROXY_LOG)
+    lock = threading.Lock()
 
     def access(line: str) -> None:
-        with _proxy_log_lock:
-            _proxy_log.write((line + "\n").encode())
-            _proxy_log.flush()
+        with lock:
+            access_log.write((line + "\n").encode())
+            access_log.flush()
 
     try:
         server = proxy.ProxyServer(
@@ -260,19 +257,18 @@ def start_proxy(cfg, model: str, small_ok: bool) -> None:
             cfg.api_key, cfg.client_timeout, access)
     except OSError as exc:
         raise SystemExit(
-            f"   cannot bind the client proxy to 127.0.0.1:{cfg.proxy_port}"
+            f"   cannot bind the client proxy to {HOST}:{cfg.proxy_port}"
             f" ({exc.strerror or exc}) — port busy (PROXY_PORT) or another"
             " stack is still running") from None
     threading.Thread(target=server.serve_forever, name="client-proxy",
                      daemon=True).start()
-    log.info("client proxy: up (openai+anthropic on 127.0.0.1:%d, helper=%s)",
-             cfg.proxy_port, small_ok)
+    log.info("client proxy: up (openai+anthropic on %s:%d, helper=%s)",
+             HOST, cfg.proxy_port, small_ok)
 
 
-def ensure_gsq_runtime(cfg) -> None:
+def ensure_gsq_runtime() -> None:
     """Install the optional packed-GSQ loader only when such a model is run."""
-    python = sys.executable
-    probe = subprocess.run([python, "-c", "import mlx_gsq"],
+    probe = subprocess.run([sys.executable, "-c", "import mlx_gsq"],
                            capture_output=True)
     if probe.returncode == 0:
         return
@@ -281,58 +277,84 @@ def ensure_gsq_runtime(cfg) -> None:
     package = ("mlx-gsq-rco @ git+https://github.com/uqer1244/"
                "mlx-GSQ-RCO.git@3b0ef3129a6bd47cbfc44d463e3c32e7dda0f9d3")
     ui.info("Installing GSQ-RCO runtime (pinned revision)")
-    subprocess.run(["uv", "pip", "install", "--python", python, package],
+    subprocess.run(["uv", "pip", "install", "--python", sys.executable, package],
                    check=True)
 
 
-def _wait_ready(url: str, proc, timeout: int, logpath: str,
-                what: str, step: int = 3) -> int:
-    waited = 0
-    while not http_ok(url):
-        if proc.poll() is not None:
-            log.error("%s died (code %s) — tail of %s:", what,
-                      proc.returncode, logpath)
-            ui.warn(f"{what} died:")
-            print("\n".join(tail(logpath, 30)))
-            raise SystemExit(1)
-        if waited >= timeout:
-            log.error("%s not ready in %ds — tail of %s:", what, timeout,
-                      logpath)
-            ui.warn(f"{what} did not become ready in {timeout}s")
-            print("\n".join(tail(logpath, 30)))
-            raise SystemExit(1)
-        print(f"\r   loading… {waited}s", end="", flush=True)
-        time.sleep(step)
-        waited += step
-    print(f"\r   ready in {waited}s        ")
-    log.info("%s ready in %ds (%s)", what, waited, url)
-    return waited
-
-
-def _server_flags(python: str) -> set[str]:
-    """Flags the installed mlx_lm.server actually accepts. The qwen4_exp PR
-    fork dropped --kv-bits/--kv-group-size (its linear-attention cache can't
+@cache
+def _server_flags(python: str) -> frozenset[str]:
+    """Flags the installed mlx_lm.server accepts. The qwen4_exp PR fork
+    dropped --kv-bits/--kv-group-size (its linear-attention cache can't
     be KV-quantized); passing them makes the server die on argparse."""
     try:
         out = subprocess.run([python, "-m", "mlx_lm.server", "--help"],
                              capture_output=True, text=True,
                              timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
-        return set()  # can't ask -> pass nothing optional
+        return frozenset()  # can't ask -> pass nothing optional
     # the usage block is ANSI-colored (flag names wrapped in escapes)
     plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
-    return {w for line in plain.splitlines() for w in line.split()
-            if w.startswith("--")}
+    return frozenset(w for line in plain.splitlines() for w in line.split()
+                     if w.startswith("--"))
 
 
-def start_mlx(cfg, model: str, max_input: int | None = None) -> None:
+def _spawn(cmd: list[str], env, logpath: str) -> subprocess.Popen:
+    logfile = _open_log(logpath)
+    log.info("spawn: %s", shlex.join(cmd))
+    try:
+        proc = subprocess.Popen(cmd, stdout=logfile,
+                                stderr=subprocess.STDOUT, env=env)
+    finally:
+        logfile.close()
+    children[:] = [p for p in children if p.poll() is None]
+    children.append(proc)
+    return proc
+
+
+def _start(cmd: list[str], env, logpath: str, url: str, timeout: int,
+           what: str) -> subprocess.Popen:
+    proc = _spawn(cmd, env, logpath)
+    waited = 0
+    while not http_ok(url):
+        if proc.poll() is not None:
+            problem = f"died (code {proc.returncode})"
+        elif waited >= timeout:
+            problem = f"did not become ready in {timeout}s"
+        else:
+            print(f"\r   loading… {waited}s", end="", flush=True)
+            time.sleep(3)
+            waited += 3
+            continue
+        log.error("%s %s — tail of %s:", what, problem, logpath)
+        ui.warn(f"{what} {problem}:")
+        print("\n".join(monitor.tail_lines(logpath, 30)))
+        raise SystemExit(1)
+    print(f"\r   ready in {waited}s        ")
+    log.info("%s ready in %ds (%s)", what, waited, url)
+    return proc
+
+
+def _model_env(cfg) -> dict[str, str]:
+    # By the time a model server starts, the cache is complete (cli verified
+    # it against the repo file list). Force offline: otherwise a partial cache
+    # would make mlx start its own background download — plain DNS (no DoH
+    # pin), xet, no token — which stalls for hours while /v1/models already
+    # answers 200.
+    env = dict(os.environ)
+    env["HF_HUB_OFFLINE"] = "1"
+    env["HF_HUB_DISABLE_XET"] = "1"
+    if cfg.hf_token:
+        env["HF_TOKEN"] = cfg.hf_token
+    return env
+
+
+def _mlx_url(port: int) -> str:
+    return f"http://{HOST}:{port}/v1/models"
+
+
+def start_mlx(cfg, model: str, max_input: int | None = None):
     ui.info(f"Starting mlx_lm.server on :{cfg.mlx_port}")
-    _pkill(_MLX_PATTERN)
-    time.sleep(1)
-    # All model processes inherit the standalone app's isolated runtime.
-    python = sys.executable
-    ctx = hf.model_ctx(cfg.hf_hub, model)
-    supported = _server_flags(python)
+    supported = _server_flags(sys.executable)
     flags = []
     if cfg.kv_bits > 0:
         if {"--kv-bits", "--kv-group-size"} <= supported:
@@ -352,40 +374,25 @@ def start_mlx(cfg, model: str, max_input: int | None = None) -> None:
             ("--min-p", "OLLMLX_MIN_P", "0.0")):
         if flag in supported:
             flags += [flag, os.environ.get(env_name, default)]
-    max_tokens = int(os.environ.get("OLLMLX_MAX_TOKENS", str(min(ctx, 32768))))
+    max_tokens = int(os.environ.get(
+        "OLLMLX_MAX_TOKENS", str(min(hf.model_ctx(cfg.hf_hub, model), 32768))))
     if "--prefill-step-size" in supported:
         # qwen3.5/3.8 MoE: a 2048-token chunk fans out to thousands of
         # expert buffers and hits the Metal resource limit (499000) —
         # mlx-lm#1644's proven workaround. Costs ~2.5x prefill speed.
         flags += ["--prefill-step-size", "512"]
-    logfile = _open_log(MLX_LOG)
-    env = dict(os.environ)
-    # By the time we start mlx, the cache is complete (cli verified it against
-    # the repo file list). Force offline: otherwise a partial cache would make
-    # mlx start its own background download — plain DNS (no DoH pin), xet, no
-    # token — which stalls for hours while /v1/models already answers 200.
-    env["HF_HUB_OFFLINE"] = "1"
-    env["HF_HUB_DISABLE_XET"] = "1"
+    env = _model_env(cfg)
     if max_input:
         # mlxwrap refuses longer prompts before the KV eval — the OOM that
         # kills the generation thread never happens
         env["OLLMLX_MAX_INPUT_TOKENS"] = str(max_input)
-    if cfg.hf_token:
-        env["HF_TOKEN"] = cfg.hf_token
-    cmd = [python, "-m", "local_llm.mlxwrap",   # mlx_lm.server + tok/s log
-           "--model", model, "--host", "127.0.0.1",
-           "--port", str(cfg.mlx_port),
-           "--max-tokens", str(max_tokens), *flags]
-    log.info("spawn: %s", shlex.join(cmd))
-    try:
-        proc = subprocess.Popen(cmd, stdout=logfile,
-                                stderr=subprocess.STDOUT, env=env)
-    finally:
-        logfile.close()
-    children.append(proc)
-    _wait_ready(f"http://127.0.0.1:{cfg.mlx_port}/v1/models", proc,
-                cfg.load_timeout, MLX_LOG, "mlx_lm.server")
-    return proc
+    # our wrapper around mlx_lm.server: same CLI, plus the tok/s log
+    return _start([sys.executable, "-m", "local_llm.mlxwrap",
+                   "--model", model, "--host", HOST,
+                   "--port", str(cfg.mlx_port),
+                   "--max-tokens", str(max_tokens), *flags],
+                  env, MLX_LOG, _mlx_url(cfg.mlx_port), cfg.load_timeout,
+                  "mlx_lm.server")
 
 
 def _reasoning_template(cfg, gguf_path):
@@ -401,7 +408,7 @@ def _reasoning_template(cfg, gguf_path):
                '{%- set reasoning_effort = "xhigh" -%}'
                '{%- endif -%}\n' + template)
     digest = hashlib.sha256(patched.encode()).hexdigest()[:20]
-    path = cfg.ollmlx_home / "templates" / f"reasoning-{digest}.jinja"
+    path = cfg.home / "templates" / f"reasoning-{digest}.jinja"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists() or path.read_text() != patched:
         path.write_text(patched)
@@ -417,9 +424,7 @@ def start_llama(cfg, gguf_path: str, alias: str,
     from . import llamacpp
     server = llamacpp.ensure_llama_server(cfg.llama_server)
     ui.info(f"Starting llama-server on :{cfg.mlx_port}")
-    _pkill(_llama_pattern(cfg.mlx_port))
-    time.sleep(1)
-    flags = ["-m", gguf_path, "--host", "127.0.0.1",
+    flags = ["-m", gguf_path, "--host", HOST,
              "--port", str(cfg.mlx_port),
              # the alias is what /v1/models reports — keep it the repo id
              # so it matches the model catalog
@@ -445,68 +450,42 @@ def start_llama(cfg, gguf_path: str, alias: str,
     elif cfg.kv_bits:
         ui.warn(f"MLX_KV_BITS={cfg.kv_bits}: llama-server quantizes KV to"
                 " q8_0 only — running without KV quantization")
-    logfile = _open_log(LLAMA_LOG)
-    cmd = [server, *flags]
-    log.info("spawn: %s", shlex.join(cmd))
-    try:
-        proc = subprocess.Popen(cmd, stdout=logfile,
-                                stderr=subprocess.STDOUT)
-    finally:
-        logfile.close()
-    children.append(proc)
-    _wait_ready(f"http://127.0.0.1:{cfg.mlx_port}/v1/models", proc,
-                cfg.load_timeout, LLAMA_LOG, "llama-server")
-    return proc
+    return _start([server, *flags], None, LLAMA_LOG, _mlx_url(cfg.mlx_port),
+                  cfg.load_timeout, "llama-server")
 
 
-def start_mlx_small(cfg) -> None:
+def start_mlx_small(cfg):
     """The tiny helper model on its own port: cheap classification/title
     calls (Claude Code's background requests have a short fixed timeout and
     would queue for minutes behind the big model's generation) plus a quick
-    `ollmlx/small` for any client. Same flags as the big one are pointless
+    `small` alias for any client. Same flags as the big one are pointless
     here: no KV quant (nothing to save on ~0.4G weights), no prompt-cache
     cap (its caches are a few MB)."""
     ui.info(f"Starting helper model {cfg.small_model} on :{cfg.mlx_small_port}")
-    # only stale instances of *this* model — start_mlx already swept the broad
-    # pattern, and the main server must survive this pkill
-    _pkill(f"local_llm\\.mlxwrap.*{re.escape(cfg.small_model)}")
-    time.sleep(1)
-    python = sys.executable
     # thinking off by default: hybrid-Qwen3 would burn ~200 hidden tokens
     # pondering a one-word answer (0.9s); a request can still re-enable it
     # via chat_template_kwargs — per-request args override the CLI ones
     flags = (["--chat-template-args", '{"enable_thinking":false}']
-             if "--chat-template-args" in _server_flags(python) else [])
-    env = dict(os.environ)
-    env["HF_HUB_OFFLINE"] = "1"
-    env["HF_HUB_DISABLE_XET"] = "1"
-    logfile = _open_log(MLX_SMALL_LOG)
-    cmd = [python, "-m", "local_llm.mlxwrap",
-           "--model", cfg.small_model, "--host", "127.0.0.1",
-           "--port", str(cfg.mlx_small_port),
-           "--max-tokens", "4096", *flags]
-    log.info("spawn: %s", shlex.join(cmd))
-    try:
-        proc = subprocess.Popen(cmd, stdout=logfile,
-                                stderr=subprocess.STDOUT, env=env)
-    finally:
-        logfile.close()
-    children.append(proc)
-    _wait_ready(f"http://127.0.0.1:{cfg.mlx_small_port}/v1/models", proc,
-                120, MLX_SMALL_LOG, "helper model")
-    return proc
+             if "--chat-template-args" in _server_flags(sys.executable) else [])
+    return _start([sys.executable, "-m", "local_llm.mlxwrap",
+                   "--model", cfg.small_model, "--host", HOST,
+                   "--port", str(cfg.mlx_small_port),
+                   "--max-tokens", "4096", *flags],
+                  _model_env(cfg), MLX_SMALL_LOG, _mlx_url(cfg.mlx_small_port),
+                  120, "helper model")
 
 
 def warmup(cfg) -> None:
-    """End-to-end warmup: the client proxy (via the `local` alias, like the
+    """End-to-end warmup: the client proxy (via the `local` alias, like
+    every client) through to the model server.
 
     Fatal on failure: /v1/models answers 200 before the weights are loaded,
     so this is the only real readiness gate — a stack that fails here would
     only serve errors (cli.run_serve still stops the servers)."""
     ui.info("Warmup request")
     req = urllib.request.Request(
-        f"http://127.0.0.1:{cfg.proxy_port}/v1/chat/completions",
-        data=json.dumps({"model": "local", "max_tokens": 8,
+        f"http://{HOST}:{cfg.proxy_port}/v1/chat/completions",
+        data=json.dumps({"model": LOCAL_ALIAS, "max_tokens": 8,
                          "messages": [{"role": "user", "content": "Say OK"}]}
                         ).encode(),
         headers={"Authorization": f"Bearer {cfg.api_key}",
@@ -523,7 +502,7 @@ def warmup(cfg) -> None:
                 "`local-llm stop`, retry; the previous run's log is "
                 f"{MLX_LOG}.1 / {LLAMA_LOG}.1")
         for path in (MLX_LOG, LLAMA_LOG, PROXY_LOG):
-            lines = tail(path, 15)
+            lines = monitor.tail_lines(path, 15)
             if lines:
                 print(f"--- last lines of {path} ---")
                 print("\n".join(lines))

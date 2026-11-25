@@ -1,19 +1,33 @@
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from local_llm import clients
 from local_llm.config import Config
 
+OMP_CONFIG = """\
+# omp's own comments survive
+setupVersion: 3
+modelRoles:
+  plan: kimi-code/k3.1-pro:max
+  default: zai/glm-5.4:xhigh
+browser:
+  relay: true   # inline comment
+"""
+OMP_CONFIG_WITH_SMOL = OMP_CONFIG.replace(
+    "  default: zai/glm-5.4:xhigh\n",
+    "  default: zai/glm-5.4:xhigh\n  smol: ollmlx/small\n")
+
 
 class ConfigHomeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="mlx-stack-config-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.home = self.tmp / "home"
         self.home.mkdir()
         self.stack = self.home / ".mlx-stack"
@@ -68,6 +82,11 @@ class ConfigHomeTests(unittest.TestCase):
         self.assertEqual(cfg.claude_cfg, self.stack / "configs" / "claude.json")
         self.assertEqual(json.loads(cfg.claude_cfg.read_text())["env"]["ANTHROPIC_MODEL"],
                          "local")
+        for harness in ("pi", "omp"):
+            models = json.loads((self.stack / "configs" / f"{harness}-models.json")
+                                .read_text())["providers"]["ollmlx"]["models"]
+            self.assertEqual([m["id"] for m in models], ["org/model", "local"])
+            self.assertEqual([m["contextWindow"] for m in models], [8192, 8192])
 
     def test_late_legacy_writers_are_merged_without_overwriting(self):
         old = self.home / ".ollmlx"
@@ -97,6 +116,66 @@ class ConfigHomeTests(unittest.TestCase):
             self.assertIn("127.0.0.1", item["api_base"])
             self.assertTrue(item["command"])
             self.assertTrue(item["model"])
+
+    def test_the_smol_role_is_one_line_that_comes_and_goes(self):
+        external = self.home / ".omp" / "agent" / "config.yml"
+        external.parent.mkdir(parents=True)
+        external.write_text(OMP_CONFIG)
+        cfg = Config.from_env()
+
+        clients.write_client_configs(cfg, "org/model", small=True, max_input=8192)
+        canonical = self.stack / "configs" / "omp-config.yml"
+        self.assertTrue(external.is_symlink())
+        self.assertEqual(external.read_text(), OMP_CONFIG_WITH_SMOL)
+
+        clients.write_client_configs(cfg, "org/model", small=False, max_input=8192)
+        self.assertEqual(external.read_text(), OMP_CONFIG)
+
+    def test_a_smol_role_that_is_not_ours_and_an_unknown_layout_stay(self):
+        external = self.home / ".omp" / "agent" / "config.yml"
+        external.parent.mkdir(parents=True)
+        cfg = Config.from_env()
+        for text in ("modelRoles:\n  smol: other/model\n",
+                     "modelRoles: {plan: other/model}\n",
+                     "setupVersion: 3\n"):
+            with self.subTest(config=text):
+                external.write_text(text)
+                clients.write_client_configs(cfg, "org/model", small=False,
+                                             max_input=8192)
+                self.assertEqual(external.read_text(), text)
+
+    def test_a_harness_without_a_config_gets_the_provider(self):
+        # opencode starts from an empty file, which is no config yet —
+        # not "JSONC to leave alone"
+        cfg = Config.from_env()
+        clients.write_client_configs(cfg, "org/model", small=True, max_input=8192)
+        opencode = json.loads((self.home / ".config" / "opencode" / "opencode.json")
+                              .read_text())
+        self.assertEqual(opencode["provider"]["ollmlx"]["models"]["local"]["name"],
+                         "org/model")
+        self.assertEqual(opencode["small_model"], "ollmlx/small")
+
+    def test_real_jsonc_is_left_to_its_owner(self):
+        external = self.home / ".config" / "opencode" / "opencode.json"
+        external.parent.mkdir(parents=True)
+        text = '{ // comment\n  "theme": "dark" }\n'
+        external.write_text(text)
+        cfg = Config.from_env()
+        clients.write_client_configs(cfg, "org/model", small=False, max_input=8192)
+        self.assertTrue(external.is_symlink())
+        self.assertEqual(external.read_text(), text)
+
+    def test_model_settings_override_the_stack_wide_ones_and_round_trip(self):
+        cfg = Config.from_env()
+        self.assertEqual(cfg.model_settings("org/model")["max_ctx"], cfg.max_ctx)
+        values = {**cfg.model_settings("org/model"), "max_ctx": 4096, "top_k": 40}
+        cfg.save_model_settings("org/model", values)
+        saved = cfg.model_settings("org/model")
+        self.assertEqual((saved["max_ctx"], saved["top_k"]), (4096, 40))
+        self.assertEqual(cfg.model_settings("org/other")["max_ctx"], cfg.max_ctx)
+        self.assertEqual(cfg.model_environment("org/model")["MLX_MAX_CTX"], "4096")
+        self.assertEqual(cfg.model_environment("org/other")["MLX_MAX_CTX"],
+                         str(cfg.max_ctx))
 
 
 if __name__ == "__main__":

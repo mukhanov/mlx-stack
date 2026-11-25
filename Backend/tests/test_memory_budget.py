@@ -85,9 +85,12 @@ class MemoryBudgetTests(unittest.TestCase):
         self.assertEqual(hf.safe_context(Path("hub"), "org/model", 0, 0), 40 * 1024**2)
 
     def test_missing_kv_metadata_falls_back_to_model_and_hard_caps(self):
-        self.kv = 0
-        self.assertIsNone(hf.memory_context_limit(Path("hub"), "org/model"))
-        self.assertEqual(hf.safe_context(Path("hub"), "org/model", 10 * 1024**3, 12_345), 12_345)
+        for unknown in (0, None):
+            with self.subTest(kv=unknown):
+                self.kv = unknown
+                self.assertIsNone(hf.memory_context_limit(Path("hub"), "org/model"))
+                self.assertEqual(
+                    hf.safe_context(Path("hub"), "org/model", 10 * 1024**3, 12_345), 12_345)
 
     def test_cache_limit_never_goes_negative(self):
         self.available = 40 * 1024**3

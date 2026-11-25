@@ -1,6 +1,5 @@
-"""Telemetry readers for the desktop monitor (the MLX Stack app): port
-status, the stack's processes, log tails, and the perf state parsed from
-the servers' logs.
+"""Telemetry readers for the app's Monitor: port status, the stack's
+processes, log tails, and the perf state parsed from the servers' logs.
 
 The tok/s numbers come from TOKPS lines that our mlx_lm.server wrapper
 (local_llm.mlxwrap) prints into ~/.mlx-stack/logs/mlx-server.log and
@@ -11,6 +10,15 @@ import re
 import socket
 
 import psutil
+
+from .net import HOST
+
+
+def _tail(path: str, window: int) -> str:
+    """The last `window` bytes of a log file as text."""
+    with open(path, "rb") as f:
+        f.seek(max(0, os.path.getsize(path) - window))
+        return f.read().decode("utf-8", "replace")
 
 
 def top_eaters(k: int = 3, exclude_pids=()) -> list:
@@ -37,7 +45,7 @@ def port_ok(port: int) -> bool:
     try:
         with socket.socket() as s:
             s.settimeout(0.4)
-            return s.connect_ex(("127.0.0.1", port)) == 0
+            return s.connect_ex((HOST, port)) == 0
     except OSError:
         return False
 
@@ -62,9 +70,11 @@ def _safe_process_iter():
 
 
 def watch_procs(small_port: int = 0, mlx_port: int = 0):
-    """[(label, Process)] for the model server(s); process_iter
-    caches instances, so cpu_percent() between frames yields meaningful
-    deltas."""
+    """[(label, Process)] for the stack's model servers: "mlx_lm.server" or
+    "llama-server" on mlx_port, "mlx-small" on small_port; 0 accepts any
+    port. A model server the user runs for something else is left out.
+    process_iter caches instances, so cpu_percent() between frames yields
+    meaningful deltas."""
     out = []
     for p in _safe_process_iter():
         try:
@@ -72,15 +82,10 @@ def watch_procs(small_port: int = 0, mlx_port: int = 0):
         except (psutil.Error, OSError, SystemError):
             continue
         if "mlx_lm.server" in cmd or "local_llm.mlxwrap" in cmd:
-            # the helper is told apart by its --port (the big model's id
-            # never contains it)
-            label = ("mlx-small" if small_port and f"--port {small_port}" in cmd
-                     else "mlx_lm.server")
-            out.append((label, p))
-        elif ("llama-server" in cmd
-              and (not mlx_port or f"--port {mlx_port}" in cmd)):
-            # ours only: the port tells it apart from an unrelated
-            # llama-server the user runs for something else
+            on_small = bool(small_port) and f"--port {small_port}" in cmd
+            if on_small or not mlx_port or f"--port {mlx_port}" in cmd:
+                out.append(("mlx-small" if on_small else "mlx_lm.server", p))
+        elif "llama-server" in cmd and (not mlx_port or f"--port {mlx_port}" in cmd):
             out.append(("llama-server", p))
     return out
 
@@ -91,10 +96,7 @@ def tail_errors(path: str, k: int = 2):
     BrokenPipeError traceback in the servers). Only the tail of the file
     is read — cheap on a live log, no multi-megabyte scans."""
     try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(max(0, size - 65536))
-            data = f.read().decode("utf-8", "replace")
+        data = _tail(path, 65536)
     except OSError:
         return []
     tokens = ("ERROR", "CRITICAL", "Traceback", "Exception")
@@ -119,10 +121,7 @@ def tail_lines(path: str, k: int = 2, window: int = 262144):
     """Last k log lines (not only errors): generation progress, requests.
     Reads up to `window` bytes of tail — enough history for scrolling."""
     try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(max(0, size - window))
-            data = f.read().decode("utf-8", "replace")
+        data = _tail(path, window)
     except OSError:
         return []
     lines = [l for l in data.splitlines() if l.strip()]
@@ -183,10 +182,7 @@ def tail_tokps(path: str):
     size before completion; the done line adds generated tokens. GGUF runs
     fall back to llama-server perf lines (one tick per request)."""
     try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(max(0, size - 16384))
-            data = f.read().decode("utf-8", "replace")
+        data = _tail(path, 16384)
     except OSError:
         return -1, 0.0, -1, 0.0, "", None, None
     live, pre = (-1, 0.0), (-1, 0.0)

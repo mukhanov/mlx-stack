@@ -500,6 +500,31 @@ class ProxyServerTests(unittest.TestCase):
             orphan.shutdown()
             orphan.server_close()
 
+    def test_the_proxy_binds_loopback_only_and_refuses_a_foreign_host(self):
+        self.assertEqual(self.proxy.server_address[0], "127.0.0.1")
+        # DNS rebinding: a page whose site name resolves to 127.0.0.1 could
+        # otherwise read answers that only a program on this machine should get
+        rebinding = {"Host": "evil.example:4000"}
+        message = "the client proxy only answers requests addressed to this machine"
+        before = len(self.main.requests), len(self.small.requests)
+        status, _, data = self.call("POST", "/v1/chat/completions", self.chat("hi"),
+                                    headers=rebinding)
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(data)["error"]["message"], message)
+        status, _, data = self.call("POST", "/v1/messages", self.chat("hi", "small"),
+                                    headers={**ANTHROPIC, **rebinding})
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(data)["error"]["type"], "permission_error")
+        self.assertEqual(self.call("GET", "/v1/models", headers=rebinding)[0], 403)
+        self.assertEqual(self.call("GET", "/health", key=None, headers=rebinding)[0], 403)
+        self.assertEqual((len(self.main.requests), len(self.small.requests)),
+                         before)
+        # this machine's own names are fine
+        port = self.proxy.server_address[1]
+        status, _, _ = self.call("POST", "/v1/chat/completions", self.chat("hi"),
+                                 headers={"Host": f"localhost:{port}"})
+        self.assertEqual(status, 200)
+
     def test_the_model_list_names_the_stack_models_in_each_clients_shape(self):
         _, _, data = self.call("GET", "/v1/models")
         listing = json.loads(data)

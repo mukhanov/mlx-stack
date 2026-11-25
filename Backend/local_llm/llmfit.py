@@ -37,11 +37,11 @@ def _is_mlx(m: dict) -> bool:
             or str(m.get("name", "")).startswith(PREFIX))
 
 
-def load(ollmlx_home: Path, refresh: bool = False) -> dict | None:
+def load(home: Path, refresh: bool = False) -> dict | None:
     """{repo_id: catalog entry} for MLX-format models, or None when nothing
     is available (no cache and no network). A failed refresh falls back to
     the stale cache. refresh=True bypasses the weekly TTL for the UI action."""
-    cache = ollmlx_home / CACHE_NAME
+    cache = home / CACHE_NAME
     models: dict | None = None
     fetched_at = 0.0
     try:
@@ -66,7 +66,7 @@ def load(ollmlx_home: Path, refresh: bool = False) -> dict | None:
     models = {m["name"]: m for m in data
               if isinstance(m, dict) and m.get("name") and _is_mlx(m)}
     try:
-        ollmlx_home.mkdir(parents=True, exist_ok=True)
+        home.mkdir(parents=True, exist_ok=True)
         with gzip.open(cache, "wt") as f:
             json.dump({"slice": SLICE, "fetched_at": int(time.time()),
                        "models": models}, f)
@@ -321,7 +321,8 @@ def _estimate_tps(e: dict, bw: float, ram_gb: float) -> float:
     quant = e.get("quantization")
     _, bpp, bypp = _Q_TABLE.get(quant, _Q_DEFAULT)
     active = e.get("active_parameters")
-    a_b = active / 1e9 if isinstance(active, (int, float)) and active and e.get("is_moe") else params
+    a_b = (active / 1e9 if isinstance(active, (int, float)) and active
+           and e.get("is_moe") else params)
     if not e.get("is_moe"):
         return max(0.1, bw / (params * bypp) * EFFICIENCY)
     # cache-pressure penalty from inactive experts polluting the pool

@@ -1,5 +1,4 @@
-"""Model knowledge: repo-name parsing, hardware-fit scoring, RAM
-recommendations and human-readable descriptions."""
+"""Model knowledge: repo-name parsing, RAM estimates and the hardware-fit score."""
 import math
 import re
 
@@ -15,26 +14,13 @@ GGUF_LORAS = {
     },
 }
 
-# Top pick per RAM class (GB -> model)
-TOP_MODELS = {
-    4: "mlx-community/Qwen3-8B-4bit",
-    8: "mlx-community/Qwen3-8B-4bit",
-    16: "mlx-community/Qwen3-32B-4bit",
-    24: "mlx-community/Qwen3-30B-A3B-4bit",
-    32: "mlx-community/Qwen3-30B-A3B-4bit",
-    64: "mlx-community/Qwen3-235B-A22B-3bit",
-    128: "mlx-community/Qwen3-235B-A22B-3bit",
-}
-
-# Fallback when the HF API is unreachable: org/repo | downloads | likes
-FALLBACK_TRENDING = [
-    ("mlx-community/Qwen3-8B-4bit", 150000, 450),
-    ("mlx-community/Qwen3-32B-4bit", 85000, 320),
-    ("mlx-community/Qwen3-30B-A3B-4bit", 45000, 180),
-    ("mlx-community/Qwen3-235B-A22B-3bit", 25000, 95),
-    ("mlx-community/Qwen3-1.7B-4bit", 200000, 520),
-    ("mlx-community/Qwen3-0.6B-4bit", 180000, 480),
-]
+# what to recommend on a machine with at least this much RAM (GB)
+_FITS_RAM = (
+    (80, "mlx-community/Qwen3-235B-A22B-3bit"),
+    (24, "mlx-community/Qwen3-30B-A3B-4bit"),
+    (16, "mlx-community/Qwen3-32B-4bit"),
+    (0, "mlx-community/Qwen3-8B-4bit"),
+)
 
 # family -> bonus for quality / MLX support
 FAMILIES = (
@@ -71,17 +57,7 @@ _RAM_RES = tuple(
 
 
 def recommend_for_ram(ram: int) -> str:
-    if ram >= 80:
-        return TOP_MODELS[64]
-    if ram >= 32:
-        return TOP_MODELS[24]
-    if ram >= 24:
-        return TOP_MODELS[24]
-    if ram >= 16:
-        return TOP_MODELS[16]
-    if ram >= 8:
-        return TOP_MODELS[8]
-    return TOP_MODELS[4]
+    return next(model for gb, model in _FITS_RAM if ram >= gb)
 
 
 def parse_model(mid: str):

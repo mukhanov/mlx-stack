@@ -16,9 +16,9 @@ import time
 import uuid
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from .config import LOCAL_ALIAS, SMALL_ALIAS
+from .net import HOST, loopback_host
 
-LOCAL_MODEL = "local"        # the main model's alias in every client config
-SMALL_MODEL = "small"        # the helper's alias in every client config
 MESSAGES_PATH = "/v1/messages"
 CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 MODELS_PATH = "/v1/models"
@@ -48,9 +48,9 @@ def build_routes(main_model: str, main_port: int, small_model: str | None = None
     must be resolved here — and anything else refused, or a stray name
     would unload the running model."""
     routes = {main_model: (main_port, main_model),
-              LOCAL_MODEL: (main_port, main_model)}
+              LOCAL_ALIAS: (main_port, main_model)}
     if small_model and small_port:
-        routes[SMALL_MODEL] = (small_port, small_model)
+        routes[SMALL_ALIAS] = (small_port, small_model)
         routes[small_model] = (small_port, small_model)
     return routes
 
@@ -438,7 +438,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _upstream(self, port: int, method: str, body: bytes | None,
                   path: str | None = None):
-        conn = HTTPConnection("127.0.0.1", port, timeout=self.server.upstream_timeout)
+        conn = HTTPConnection(HOST, port, timeout=self.server.upstream_timeout)
         headers = {"Accept-Encoding": "identity"}
         for name in FORWARDED_HEADERS:
             if self.headers.get(name):
@@ -459,6 +459,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         t0 = time.monotonic()
+        if not loopback_host(self.headers, self.server.port):
+            return self._refuse(t0)
         path = self.path.split("?", 1)[0]
         if path in HEALTH_PATHS:
             return self._reply(200, {"status": "ok"})
@@ -472,6 +474,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         t0 = time.monotonic()
         raw = self._body()      # read first: keep-alive needs a drained socket
+        if not loopback_host(self.headers, self.server.port):
+            return self._refuse(t0)
         if not self._authorized():
             return self._deny(t0)
         try:
@@ -489,7 +493,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0] == MESSAGES_PATH and route:
             return self._messages(raw, model, route, t0)
         self._relay(raw, model, route, t0)
-
 
     def _model_list(self) -> dict:
         names = list(self.server.routes)
@@ -511,6 +514,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             payload = openai_error("Invalid API key")
         self._access(t0, 401, None, 0, self._reply(401, payload))
 
+    def _refuse(self, t0: float) -> None:
+        """403 for a request naming another site in Host: a web page that
+        reached the port through DNS rebinding (see net.py)."""
+        message = ("the client proxy only answers requests addressed"
+                   " to this machine")
+        payload = (anthropic_error("permission_error", message)
+                   if self._is_anthropic()
+                   else openai_error(message, "forbidden"))
+        self._access(t0, 403, None, 0, self._reply(403, payload))
+
     def _unknown_model(self, model, t0: float) -> None:
         if self._is_anthropic():
             payload = anthropic_error("not_found_error", f"model: {model}")
@@ -519,7 +532,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._access(t0, 404, model, 0, self._reply(404, payload))
 
     def _unreachable(self, model, port: int, t0: float) -> None:
-        message = (f"the model server on 127.0.0.1:{port} is not reachable"
+        message = (f"the model server on {HOST}:{port} is not reachable"
                    " (still loading, stopped or crashed)")
         payload = (anthropic_error("overloaded_error", message)
                    if self._is_anthropic() else openai_error(message))
@@ -626,7 +639,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             status = 502
         self._access(t0, status, requested, port, size, stream=True)
 
-
 class ProxyServer(ThreadingHTTPServer):
     request_queue_size = 128
     daemon_threads = True
@@ -635,9 +647,10 @@ class ProxyServer(ThreadingHTTPServer):
                  upstream_timeout: float, access):
         """`routes` comes from build_routes(); `access(line)` receives one
         access-log line per request."""
-        super().__init__(("127.0.0.1", port), ProxyHandler)
+        super().__init__((HOST, port), ProxyHandler)
+        self.port = self.server_address[1]
         self.routes = routes
-        self.main_port = routes[LOCAL_MODEL][0]
+        self.main_port = routes[LOCAL_ALIAS][0]
         self.api_key, self.upstream_timeout = api_key, upstream_timeout
         self.started = int(time.time())
         self.access = access

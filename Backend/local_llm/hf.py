@@ -1,5 +1,6 @@
-"""HuggingFace: DoH workaround for broken DNS, top models via the API,
-local cache (~/.cache/huggingface/hub), download and deletion."""
+"""Hugging Face: the model catalog API, the local cache
+(~/.cache/huggingface/hub), resumable downloads and deletion."""
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -8,6 +9,9 @@ import re
 import shutil
 import socket
 import stat
+import sys
+import threading
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -22,6 +26,12 @@ DOH = "https://1.1.1.1/dns-query"
 _pinned: dict = {}
 _orig_gai = socket.getaddrinfo
 _installed = False
+
+_HUB = "https://huggingface.co"
+# .gguf files that are not the model: calibration data, vision projectors and
+# MTP draft heads (a draft for --model-draft, never the model itself)
+_GGUF_SIDE_FILE = re.compile(r"imatrix|mmproj|(^|-)mtp-")
+_RANGED_MIN = 1 << 30   # files this big are fetched by _fetch_ranged
 
 
 def _doh(host: str):
@@ -53,6 +63,9 @@ def install_doh() -> None:
         _installed = True
 
 
+# --- the hub API -------------------------------------------------------------------
+
+
 def fetch_page(skip: int = 0, limit: int = 50, token: str | None = None,
                scope: str = "community", search: str | None = None,
                fmt: str = "mlx"):
@@ -69,12 +82,11 @@ def fetch_page(skip: int = 0, limit: int = 50, token: str | None = None,
     out = []
     for tag in ("text-generation", "image-text-to-text"):
         if fmt == "gguf":
-            url = f"https://huggingface.co/api/models?filter=gguf,{tag}"
+            url = f"{_HUB}/api/models?filter=gguf,{tag}"
         elif scope == "community":
-            url = (f"https://huggingface.co/api/models?author=mlx-community"
-                   f"&pipeline_tag={tag}")
+            url = f"{_HUB}/api/models?author=mlx-community&pipeline_tag={tag}"
         else:
-            url = f"https://huggingface.co/api/models?filter=mlx,{tag}"
+            url = f"{_HUB}/api/models?filter=mlx,{tag}"
         url += f"&sort=downloads&direction=-1&limit={limit}&skip={skip}"
         if search:
             url += f"&search={urllib.parse.quote(search)}"
@@ -89,42 +101,54 @@ def fetch_page(skip: int = 0, limit: int = 50, token: str | None = None,
     return out
 
 
-def fetch_stats(repo: str, token: str | None):
-    """Current downloads, likes and total repository size in bytes."""
+def _repo_info(repo: str, token: str | None) -> dict | None:
+    """The repository's metadata — its files with sizes and hashes,
+    downloads, likes — or None when the HF API is unreachable."""
     install_doh()
-    req = urllib.request.Request(
-        f"https://huggingface.co/api/models/{repo}?blobs=true",
-        headers={"accept": "application/json"})
+    req = urllib.request.Request(f"{_HUB}/api/models/{repo}?blobs=true",
+                                 headers={"accept": "application/json"})
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=10) as r:
-        data = json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+    except Exception:  # noqa: BLE001 — to the callers every failure is "unreachable"
+        return None
+
+
+def fetch_stats(repo: str, token: str | None) -> dict:
+    """Current downloads, likes and total repository size in bytes. Raises
+    when the HF API is unreachable."""
+    data = _repo_info(repo, token)
+    if data is None:
+        raise OSError(f"Hugging Face API unreachable for {repo}")
     return {"downloads": int(data.get("downloads") or 0),
             "likes": int(data.get("likes") or 0),
             "size_bytes": sum(int(s.get("size") or 0)
                               for s in data.get("siblings", []))}
 
 
+def repo_size(repo: str, token: str | None) -> int:
+    """Bytes the repository's files add up to; 0 when the HF API is
+    unreachable (a download's progress then shows without a percentage)."""
+    info = _repo_info(repo, token)
+    return sum(int(s.get("size") or 0) for s in (info or {}).get("siblings", []))
+
+
+def _is_model_gguf(name: str) -> bool:
+    return name.endswith(".gguf") and not _GGUF_SIDE_FILE.search(
+        name.rsplit("/", 1)[-1].lower())
+
+
 def repo_gguf_files(repo: str, token: str | None):
-    """[(file name, bytes)] of quantized .gguf files in the repo, quants in
-    subdirs included (SC117-style layouts); imatrix/mmproj/mtp draft files
-    excluded (mtp can be a prefix too: `mtp-Qwen3….gguf` — draft heads for
-    --model-draft, never the model). [] when the repo has none, None when
-    the HF API is unreachable."""
-    siblings = _repo_siblings(repo, token)
-    if siblings is None:
+    """[(file name, bytes)] of the model's .gguf files in the repo, quants in
+    subdirs included (SC117-style layouts). [] when the repo has none, None
+    when the HF API is unreachable."""
+    info = _repo_info(repo, token)
+    if info is None:
         return None
-    out = []
-    for s in siblings:
-        name = s.get("rfilename", "")
-        if not name.endswith(".gguf"):
-            continue
-        base = name.rsplit("/", 1)[-1].lower()
-        if ("imatrix" in base or "mmproj" in base or "-mtp-" in base
-                or base.startswith("mtp-")):
-            continue
-        out.append((name, s.get("size") or 0))
-    return out
+    return [(s["rfilename"], s.get("size") or 0) for s in info.get("siblings", [])
+            if _is_model_gguf(s.get("rfilename", ""))]
 
 
 def gguf_groups(files):
@@ -145,6 +169,7 @@ def gguf_groups(files):
     out.sort(key=lambda t: -t[1])
     return out
 
+
 def gguf_set_complete(names) -> bool:
     """Does the shard set carry its first split? Grouping strips the
     -NNNNN-of- suffixes, so a set that lost its 00001 file still looks
@@ -154,43 +179,6 @@ def gguf_set_complete(names) -> bool:
         re.search(r"-\d{5}-of-\d{5}", n) for n in names)
 
 
-def _repo_siblings(repo: str, token: str | None):
-    """Repo file list from the HF API (?blobs=true), or None if unreachable."""
-    install_doh()
-    req = urllib.request.Request(
-        f"https://huggingface.co/api/models/{repo}?blobs=true",
-        headers={"accept": "application/json"})
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read().decode()).get("siblings", [])
-    except Exception:
-        return None
-
-
-def _repo_file_meta(repo: str, token: str | None, allow_patterns=None):
-    """(total repo size in bytes, {sha256-blob: file name}, file count) from
-    the HF API, restricted to allow_patterns when given (a GGUF fetch is
-    one quant file, not the whole 100GB repo). On failure — (0, {}, 0):
-    progress shows without percentages."""
-    siblings = _repo_siblings(repo, token) or []
-    if allow_patterns:
-        siblings = [s for s in siblings
-                    if any(fnmatch.fnmatch(s.get("rfilename", ""), p)
-                           for p in allow_patterns)]
-    total = 0
-    by_blob = {}
-    for s in siblings:
-        if s.get("size"):
-            total += s["size"]
-        # cache blobs are named by lfs.sha256 (for LFS) or blobId (git files)
-        oid = (s.get("lfs") or {}).get("sha256") or s.get("blobId")
-        if oid:
-            by_blob[oid] = s.get("rfilename", "?")
-    return total, by_blob, len(siblings)
-
-
 def missing_files(hf_hub: Path, repo: str, token: str | None):
     """Repo files the local snapshot lacks, or None if the HF API is
     unreachable (completeness can't be verified).
@@ -198,18 +186,18 @@ def missing_files(hf_hub: Path, repo: str, token: str | None):
     A partial download passes is_cached(): hub creates snapshot links only
     for finished files, so absent shards are invisible without the repo's
     file list. Broken links count as missing (is_file() doesn't follow them)."""
-    siblings = _repo_siblings(repo, token)
-    if siblings is None:
+    info = _repo_info(repo, token)
+    if info is None:
         return None
     have = set()
     for snap in (model_dir(hf_hub, repo) / "snapshots").glob("*"):
-        if not snap.is_dir():
-            continue
-        for f in snap.rglob("*"):
-            if f.is_file():
-                have.add(str(f.relative_to(snap)))
-    return [s.get("rfilename") for s in siblings
+        if snap.is_dir():
+            have.update(str(f.relative_to(snap)) for f in snap.rglob("*") if f.is_file())
+    return [s["rfilename"] for s in info.get("siblings", [])
             if s.get("rfilename") and s["rfilename"] not in have]
+
+
+# --- download ----------------------------------------------------------------------
 
 
 def _scan_download(model_dir: Path):
@@ -247,14 +235,13 @@ def _fmt_eta(sec: float) -> str:
     return f"{m}m{s:02d}s" if m else f"{s}s"
 
 
-def _prune_partials(model_dir: Path) -> int:
+def _prune_partials(blobs: Path) -> int:
     """Remove leftovers from previous attempts (*.incomplete), return their size.
 
     hub 1.x downloads into a temp file with a unique infix and never reuses it
     across runs — such leftovers are useless (they can only survive a hard
     kill of the process)."""
     freed = 0
-    blobs = model_dir / "blobs"
     if not blobs.is_dir():
         return 0
     for f in blobs.glob("*.incomplete"):
@@ -269,9 +256,8 @@ def _prune_partials(model_dir: Path) -> int:
 def _repo_sha(repo: str, token: str | None) -> str:
     """HEAD commit of main, to link a ranged-fetched blob into
     snapshots/<commit>/. Empty string when the API is unreachable."""
-    req = urllib.request.Request(
-        f"https://huggingface.co/api/models/{repo}/revision/main",
-        headers={"accept": "application/json"})
+    req = urllib.request.Request(f"{_HUB}/api/models/{repo}/revision/main",
+                                 headers={"accept": "application/json"})
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
@@ -281,10 +267,10 @@ def _repo_sha(repo: str, token: str | None) -> str:
         return ""
 
 
-def _ranged_files(repo: str, token: str | None, allow_patterns):
-    """[(name, size, lfs sha256)] of weight files to fetch via
-    _fetch_ranged: every LFS file of at least 1GiB — safetensors and GGUF
-    shards; tokenizer/config files stay on the hub path.
+def _ranged_files(info: dict, allow_patterns) -> list[tuple[str, int, str]]:
+    """[(name, size, lfs sha256)] of the files _fetch_ranged fetches: every
+    LFS file of at least 1GiB — safetensors and GGUF shards; tokenizer and
+    config files stay on the hub path.
 
     hub 1.x cannot resume a big file across runs: its temp name carries a
     fresh uuid per call and is unlinked on failure, so a dropped connection
@@ -292,14 +278,15 @@ def _ranged_files(repo: str, token: str | None, allow_patterns):
     2026-10-30). Files over the hub client's plain-HTTP cap it refuses to
     start at all."""
     out = []
-    for s in _repo_siblings(repo, token) or []:
+    for s in info.get("siblings", []):
         name = s.get("rfilename", "")
         if allow_patterns is not None and name not in allow_patterns:
             continue
         sha = (s.get("lfs") or {}).get("sha256")
-        if sha and (s.get("size") or 0) >= 1 << 30:
+        if sha and (s.get("size") or 0) >= _RANGED_MIN:
             out.append((name, s["size"], sha))
     return out
+
 
 def _tail_matches(url: str, token: str | None, path: Path) -> bool:
     """Is `path` a true prefix of the file at `url`? Compare its last
@@ -340,10 +327,8 @@ def _fetch_ranged(repo: str, name: str, size: int, sha: str,
     uses internally — chunk it ourselves: every stall re-requests from the
     byte count on disk, a killed hub download's prefix is adopted, and the
     sha256 is verified before the blob is linked into the snapshot."""
-    import time
-    url = f"https://huggingface.co/{repo}/resolve/main/{name}"
-    model_dir = hf_hub / ("models--" + repo.replace("/", "--"))
-    blobs = model_dir / "blobs"
+    url = f"{_HUB}/{repo}/resolve/main/{name}"
+    blobs = model_dir(hf_hub, repo) / "blobs"
     blob, part = blobs / sha, blobs / (sha + ".ranged")
     if blob.is_file():
         if blob.stat().st_size == size:
@@ -423,14 +408,14 @@ def _fetch_ranged(repo: str, name: str, size: int, sha: str,
         print(f"   {name.rsplit('/', 1)[-1]}: sha256 mismatch on the"
               " resumed prefix — refetching from scratch", flush=True)
     os.replace(part, blob)
-    ref = model_dir / "refs" / "main"
+    ref = model_dir(hf_hub, repo) / "refs" / "main"
     commit = (ref.read_text().strip() if ref.is_file()
               else _repo_sha(repo, token))
     if not commit:
         blob.unlink(missing_ok=True)
         raise SystemExit(f"   {name}: fetched, but no snapshot commit"
                          " known to link it into — retry the run")
-    link = model_dir / "snapshots" / commit / name
+    link = model_dir(hf_hub, repo) / "snapshots" / commit / name
     link.parent.mkdir(parents=True, exist_ok=True)
     if not link.is_symlink():
         os.symlink(os.path.relpath(blob, link.parent), link)
@@ -443,7 +428,6 @@ def _fetch_lock(md: Path):
     raced the user's own local-llm and blobs came out wrong (one gained
     a second writer's bytes, another lost its header). The fd releases
     when download()'s frame drops on any exit path."""
-    import fcntl
     md.mkdir(parents=True, exist_ok=True)
     f = open(md / "fetch.lock", "w")
     try:
@@ -457,13 +441,11 @@ def _fetch_lock(md: Path):
 
 
 def download(repo: str, token: str | None = None, hf_hub: Path | None = None,
-             poll: float = 1.0, attempts: int = 5,
              allow_patterns: list[str] | None = None) -> None:
     """snapshot_download with DoH pinning, without xet/hf_transfer, with our
     own progress display and flaky-network retries. allow_patterns limits
     the fetch to those files (GGUF: only the chosen quant); LFS files of
     1GiB and up go through _fetch_ranged, resumable across runs.
-
 
     huggingface_hub's native tqdm bars ("Downloading bytes", "Reconstructing",
     "Fetching N files") are disabled: instead there's a single line with a
@@ -471,7 +453,7 @@ def download(repo: str, token: str | None = None, hf_hub: Path | None = None,
     dir, expected size comes from the HF API). The token goes into the
     HF_TOKEN env — huggingface_hub picks it up itself.
 
-    On failure the whole snapshot_download is retried up to `attempts` times:
+    On failure the whole snapshot_download is retried up to 5 times:
     hub instantly re-verifies finished blobs and re-fetches only the missing
     files, so a proxy that dies every few GB still converges."""
     install_doh()
@@ -480,39 +462,45 @@ def download(repo: str, token: str | None = None, hf_hub: Path | None = None,
     os.environ["HF_HUB_DISABLE_XET"] = "1"
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import snapshot_download   # lazy: --help stays fast
     try:
         from huggingface_hub.utils import disable_progress_bars
         disable_progress_bars()
     except Exception:
         pass
 
-    import shutil
-    import sys
-    import threading
-    import time
-
     print(f"==> fetching {repo}", flush=True)
-    total, name_by_blob, total_files = _repo_file_meta(repo, token,
-                                                       allow_patterns)
     if hf_hub is None:  # same resolution as snapshot_download
         hf_hub = Path(os.environ.get(
             "HF_HUB_CACHE", "~/.cache/huggingface/hub")).expanduser()
     model_dir = hf_hub / ("models--" + repo.replace("/", "--"))
+    info = _repo_info(repo, token) or {}
+    files = [s for s in info.get("siblings", [])
+             if not allow_patterns or any(fnmatch.fnmatch(s.get("rfilename", ""), p)
+                                          for p in allow_patterns)]
+    total = sum(int(s.get("size") or 0) for s in files)
+    # hub names a temp file after the LFS sha256, or the git blob id
+    name_by_blob = {}
+    for s in files:
+        oid = (s.get("lfs") or {}).get("sha256") or s.get("blobId")
+        if oid:
+            name_by_blob[oid] = s.get("rfilename", "?")
+    total_files = len(files)
     lock = _fetch_lock(model_dir)   # one fetcher per repo, any exit releases
     # resumable shards first — they adopt hub's *.incomplete leftovers as
     # resume prefixes, so this must run before _prune_partials sweeps them
-    for name, size, sha in _ranged_files(repo, token, allow_patterns):
+    for name, size, sha in _ranged_files(info, allow_patterns):
         ui.info(f"{name.rsplit('/', 1)[-1]}: resumable fetch — connection"
                 " drops continue from the bytes already on disk")
         _fetch_ranged(repo, name, size, sha, token, hf_hub)
-    freed = _prune_partials(model_dir)
+    freed = _prune_partials(model_dir / "blobs")
     if freed > 1024 * 1024:
         ui.info(f"pruned stale partials from previous attempts: {ui.human_bytes(freed)}")
     is_tty = sys.stdout.isatty()
     term_w = shutil.get_terminal_size((100, 20)).columns
 
     state = {"error": None, "attempt": 0}
+    attempts = 5
 
     def worker():
         for attempt in range(1, attempts + 1):
@@ -540,7 +528,7 @@ def download(repo: str, token: str | None = None, hf_hub: Path | None = None,
     last_done, last_t, rate, ticks, last_attempt = 0, time.monotonic(), 0.0, 0, 0
     try:
         while thread.is_alive():
-            time.sleep(poll)
+            time.sleep(1)
             if state["attempt"] > last_attempt:
                 last_attempt = state["attempt"]
                 print(f"\n   attempt {state['attempt']}/{attempts}"
@@ -578,7 +566,8 @@ def download(repo: str, token: str | None = None, hf_hub: Path | None = None,
             ticks += 1
         thread.join()
     except KeyboardInterrupt:
-        print("\n   interrupted — there is no resume, files restart on the next run")
+        print("\n   interrupted — finished files are kept and the next run"
+              " resumes the big shards")
         raise
 
     if state["error"] is not None:
@@ -588,7 +577,7 @@ def download(repo: str, token: str | None = None, hf_hub: Path | None = None,
         print("\r" + " " * (term_w - 1) + "\r", end="", flush=True)
 
 
-# --- local cache ----------------------------------------------------------------
+# --- local cache --------------------------------------------------------------------
 
 
 def model_dir(hf_hub: Path, repo: str) -> Path:
@@ -612,16 +601,13 @@ def is_cached(hf_hub: Path, repo: str) -> bool:
 
 def local_gguf_files(hf_hub: Path, repo: str):
     """[(file name, bytes)] of servable .gguf files in the local snapshot
-    with live links — subdirs included, imatrix/mmproj/mtp extras excluded
-    (mmproj files are .gguf too, but vision projectors, not models)."""
+    with live links — subdirs included, side files excluded."""
     out = []
     for snap in (model_dir(hf_hub, repo) / "snapshots").glob("*"):
         if not snap.is_dir():
             continue
         for f in snap.rglob("*.gguf"):
-            base = f.name.lower()
-            if ("imatrix" in base or "mmproj" in base or "-mtp-" in base
-                    or base.startswith("mtp-")):
+            if not _is_model_gguf(f.name):
                 continue
             try:
                 if f.exists():   # broken symlink -> skip, stat follows it
@@ -660,19 +646,16 @@ def gguf_local_path(hf_hub: Path, repo: str, prefer: str | None = None) -> Path 
     return None
 
 
-def _dir_size(root: Path, hub_root: Path | None = None) -> int:
-    """Real disk usage of a model.
-
-    Symlinks are counted once by their resolved target, not by the link
-    (snapshots point into blobs). Without hub_root targets are not resolved:
-    the old mode where all files lived inside the model's own dir. With
-    hub_root we also account for the shared store hub/blobs/<xx>/<sha>
-    (the shared-CAS layout of hub 1.x: the model dir holds only symlinks,
-    the actual weights live in the CAS)."""
+def _dir_size(root: Path, hub: Path) -> int:
+    """Real disk usage of a model directory. Symlinks are counted once by
+    their resolved target, not by the link: snapshot links point into the
+    model's own blobs/ (counted by the walk itself) or into the shared
+    store hub/blobs/<xx>/<sha> — the layout of hub 1.x, where the model dir
+    holds only links and the weights live in the store."""
     seen: set[str] = set()
     size = 0
     root_s = os.path.realpath(root)  # compare paths after resolving all
-    hub_s = os.path.realpath(hub_root) if hub_root else None  # symlinks (/var -> /private/var)
+    hub_s = os.path.realpath(hub)    # symlinks (/var -> /private/var)
     for dirpath, _dirs, files in os.walk(root):
         for f in files:
             fp = os.path.join(dirpath, f)
@@ -684,14 +667,13 @@ def _dir_size(root: Path, hub_root: Path | None = None) -> int:
                 size += st.st_size
                 continue
             # symlink: a target inside the dir is counted by the walk itself
-            # (snapshot -> blobs), resolve only targets outside it (hub CAS)
+            # (snapshot -> blobs), resolve only targets outside it (hub store)
             try:
                 tgt = os.path.realpath(fp)
                 tst = os.stat(tgt)  # broken link -> OSError
             except OSError:
                 continue
-            if (hub_s is None or tgt.startswith(root_s + os.sep)
-                    or not tgt.startswith(hub_s + os.sep)):
+            if tgt.startswith(root_s + os.sep) or not tgt.startswith(hub_s + os.sep):
                 continue
             if tgt not in seen:
                 seen.add(tgt)
@@ -700,8 +682,8 @@ def _dir_size(root: Path, hub_root: Path | None = None) -> int:
 
 
 def model_disk_bytes(hf_hub: Path, repo: str) -> int:
-    """Bytes a downloaded model occupies (shared CAS blobs counted once),
-    0 when not on disk — the crash-guard's 'weights are this big' number."""
+    """Bytes a downloaded model occupies (shared blobs counted once),
+    0 when not on disk — the crash guard's 'weights are this big' number."""
     d = model_dir(hf_hub, repo)
     return _dir_size(d, hf_hub) if d.is_dir() else 0
 
@@ -759,7 +741,7 @@ def scan_installed(hf_hub: Path):
 
 def delete_model(hf_hub: Path, repo: str) -> None:
     """Delete a model: the models--org--repo dir + its files in the shared
-    CAS hub/blobs/<xx>/<sha>, unless another model still references them."""
+    store hub/blobs/<xx>/<sha>, unless another model still references them."""
     d = model_dir(hf_hub, repo)
     cas = os.path.realpath(hf_hub / "blobs")  # /var -> /private/var on macOS
     targets = set()
@@ -802,6 +784,9 @@ def delete_model(hf_hub: Path, repo: str) -> None:
             pass
 
 
+# --- what a model needs ------------------------------------------------------------
+
+
 def packed_format(hf_hub: Path, repo: str) -> str | None:
     """Custom Safetensors packing format from a downloaded model manifest."""
     for snap in (model_dir(hf_hub, repo) / "snapshots").glob("*"):
@@ -810,42 +795,9 @@ def packed_format(hf_hub: Path, repo: str) -> str | None:
             try:
                 value = json.loads(f.read_text()).get("format")
                 return value if isinstance(value, str) else None
-            except Exception:
+            except (OSError, ValueError, AttributeError):
                 return None
     return None
-
-
-def model_ctx(hf_hub: Path, repo: str) -> int:
-    """Context window from the model's config.json (including text_config);
-    GGUF repos ship none — the .gguf header is parsed instead."""
-    for snap in (model_dir(hf_hub, repo) / "snapshots").glob("*"):
-        cfg = snap / "config.json"
-        if not cfg.is_file():
-            continue
-        try:
-            c = json.loads(cfg.read_text())
-        except Exception:
-            continue
-
-        def find(d):
-            for k in ("max_position_embeddings", "seq_length"):
-                if isinstance(d.get(k), int):
-                    return d[k]
-            for v in d.values():
-                if isinstance(v, dict):
-                    r = find(v)
-                    if r:
-                        return r
-            return None
-
-        r = find(c)
-        if r:
-            return r
-    p = gguf_local_path(hf_hub, repo)
-    if p:
-        from .llamacpp import gguf_ctx_kv   # local import: keeps llamacpp
-        return gguf_ctx_kv(p)[0]            # out of non-GGUF startup paths
-    return 32768
 
 
 def _config_of(hf_hub: Path, repo: str):
@@ -855,7 +807,7 @@ def _config_of(hf_hub: Path, repo: str):
         if cfg.is_file():
             try:
                 return json.loads(cfg.read_text())
-            except Exception:
+            except (OSError, ValueError):
                 return None
     return None
 
@@ -872,6 +824,30 @@ def _dig(d, *keys):
             if r:
                 return r
     return None
+
+
+def model_ctx(hf_hub: Path, repo: str) -> int:
+    """Context window from the model's config.json (including text_config);
+    GGUF repos ship none — the .gguf header is parsed instead."""
+    def find(d):
+        for k in ("max_position_embeddings", "seq_length"):
+            if isinstance(d.get(k), int):
+                return d[k]
+        for v in d.values():
+            if isinstance(v, dict):
+                r = find(v)
+                if r:
+                    return r
+        return None
+
+    ctx = find(_config_of(hf_hub, repo) or {})
+    if ctx:
+        return ctx
+    p = gguf_local_path(hf_hub, repo)
+    if p:
+        from .llamacpp import gguf_ctx_kv   # local import: keeps llamacpp
+        return gguf_ctx_kv(p)[0]            # out of non-GGUF startup paths
+    return 32768
 
 
 def model_kv_per_token(hf_hub: Path, repo: str) -> float | None:
@@ -925,12 +901,19 @@ def memory_cache_limit(hf_hub: Path, repo: str, reclaimable_bytes: int = 0):
     return max(0, available - reserve - weights)
 
 
+def _kv_bytes(hf_hub: Path, repo: str, kv_bits: int) -> float | None:
+    """KV-cache bytes per token at this quantization (0 keeps fp16); None
+    when nothing says what the model needs."""
+    kv = model_kv_per_token(hf_hub, repo)
+    return kv * ((kv_bits or 16) / 16) if kv else None
+
+
 def memory_context_limit(hf_hub: Path, repo: str, reclaimable_bytes: int = 0,
                          reserved_cache_bytes: int = 0, kv_bits: int = 0):
     """Context that keeps weights + KV + 10% reserve inside currently
     available RAM. Conservative when the model is already loaded."""
-    kv = model_kv_per_token(hf_hub, repo) * ((kv_bits or 16) / 16)
-    if not kv:
+    kv = _kv_bytes(hf_hub, repo, kv_bits)
+    if kv is None:
         return None
     budget = max(0, memory_cache_limit(hf_hub, repo, reclaimable_bytes)
                - reserved_cache_bytes)
@@ -950,10 +933,8 @@ def safe_context(hf_hub: Path, repo: str, prompt_cache_bytes: int,
     lims = [ctx]
     if cap:
         lims.append(cap)
-    if prompt_cache_bytes:
-        kv = model_kv_per_token(hf_hub, repo) * ((kv_bits or 16) / 16)
-        if kv:
-            lims.append(int(prompt_cache_bytes / kv))
+    if prompt_cache_bytes and (kv := _kv_bytes(hf_hub, repo, kv_bits)):
+        lims.append(int(prompt_cache_bytes / kv))
     ram_limit = memory_context_limit(hf_hub, repo, reclaimable_bytes,
                                      prompt_cache_bytes, kv_bits)
     if ram_limit is not None:

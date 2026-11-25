@@ -1,4 +1,4 @@
-"""Commands and orchestration: serve / stop / rm / list / help."""
+"""Commands and orchestration: serve / stop / list / rm / token."""
 import os
 import signal
 import sys
@@ -9,65 +9,50 @@ import psutil
 from . import applog, clients, hf, llmfit, models, servers, ui, widget
 from .applog import log
 from .config import Config
+from .net import HOST
 
 USAGE = """\
-local-llm — bring up a local model + an API for claude / pi / omp / opencode.
+local-llm — the MLX Stack backend: a local model behind OpenAI and Anthropic
+APIs on localhost.
 
-What it does:
-  1. Fetches the model (MLX or GGUF), picking a GGUF quant that fits free
-     RAM unless you name one.
-  2. Starts the model server (mlx_lm.server for MLX, llama-server for GGUF;
-     OpenAI API), a tiny helper model (:8081, alias ollmlx/small — Claude
-     Code's background calls like title generation, any client's quick
-     asks) and a client proxy (:4000, a thread of this process — OpenAI
-     requests relayed, Anthropic /v1/messages translated for Claude Code).
-     The servers are foreground children, no daemons: exiting or Ctrl-C
-     stops everything at once.
-  3. Registers the model (+ the fixed alias ollmlx/local) in
-     ~/.pi/agent/models.json, ~/.omp/agent/models.json,
-     ~/.config/opencode/opencode.json and generates
-     ~/.mlx-stack/configs/claude.json.
-  4. Prints the client launch commands and serves until SIGTERM or Ctrl-C.
+Usage:
+  local-llm serve <org/model> [quant]   start the stack in the foreground
+  local-llm <org/model> [quant]         the same, without "serve"
+  local-llm list                        downloaded models, size and RAM estimate
+  local-llm stop                        stop servers left over from an interrupted run
+  local-llm rm [org/repo…]              delete downloaded models (prompts when
+                                        called without arguments)
+  local-llm token [hf_… | --clear]      show, save or clear the Hugging Face token
+  local-llm widget                      open MLX Stack.app
 
-Usage (symlink: ~/bin/local-llm):
-  local-llm serve <org/model> [quant]  # run the stack in the foreground
-  local-llm <org/model> [quant]        # the same, without the word "serve"
-                           # GGUF quant: file name, quant name or a substring
-                           # of it (Q4_K_M, iq4_xs, …; default: best for free RAM)
-  local-llm list           # show downloaded models (with sizes)
-  local-llm widget           # native desktop monitor, updates every second
-  local-llm stop            # kill servers leaked from a previous run
-  local-llm rm [org/repo…] # delete downloaded models from disk (no args — prompt)
-  local-llm token [hf_…]   # HF token: show / save / --clear (or env HF_TOKEN)
+<org/model> is a Hugging Face repository. MLX weights run on mlx_lm.server,
+GGUF weights on llama-server (downloaded on first use). [quant] names a GGUF
+quantization — file name, quant name or a substring of it; the default is the
+largest that fits free RAM.
 
-Env: MLX_KV_BITS=8 (KV-cache quantization, 0=off), MLX_PROMPT_CACHE_BYTES (0=off),
-     MLX_MAX_CTX=110000 (hard context ceiling for clients + server refusal),
-     MLX_PORT, PROXY_PORT, WIDGET_PORT, LOAD_TIMEOUT, CLIENT_TIMEOUT=1800 (request/stream
-     seconds for the proxy + clients), MLX_STACK_HOME / OLLMLX_HOME, HF_HUB_CACHE,
-     OLLMLX_SMALL_MODEL / MLX_SMALL_PORT (tiny helper model for fast calls),
-     OLLMLX_LLAMA_SERVER (path to a llama-server binary; default: managed
-     download into ~/.mlx-stack/llama.cpp for GGUF models)"""
+serve fetches the model when it is missing, starts the model server (:19797),
+the helper model for fast calls (:8081) and the client proxy (:4000), points
+pi, omp, opencode and Claude Code at it, and runs until Ctrl-C or SIGTERM.
+
+Environment: MLX_PORT, MLX_SMALL_PORT, PROXY_PORT, WIDGET_PORT,
+MLX_STACK_HOME, HF_HUB_CACHE, HF_TOKEN; launch settings MLX_MAX_CTX,
+MLX_PROMPT_CACHE_BYTES, MLX_KV_BITS, MLX_KV_GROUP_SIZE, LOAD_TIMEOUT,
+CLIENT_TIMEOUT, OLLMLX_TEMP, OLLMLX_TOP_P, OLLMLX_TOP_K, OLLMLX_MIN_P,
+OLLMLX_MAX_TOKENS; OLLMLX_SMALL_MODEL (helper model), OLLMLX_LLAMA_SERVER
+(path to a llama-server binary; default: a managed download)."""
 
 
 def main(argv: list[str] | None = None) -> int:
     if argv is None:   # the console script calls main() with no args
         argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
     applog.setup()   # first thing: a crash anywhere must already be logged
-    if argv and argv[0] in ("-h", "--help", "help"):
-        print(USAGE)
-        return 0
-    return _dispatch(argv)
-
-
-def _dispatch(argv: list[str]) -> int:
     cfg = Config.from_env()
-    if not argv:
-        print(USAGE)
-        return 0
     cmd, rest = argv[0], argv[1:]
     if cmd == "stop":
-        servers.stop_all(cfg.mlx_port)
-        return 0
+        return cmd_stop(cfg)
     if cmd == "token":
         return cmd_token(cfg, rest)
     if cmd in ("rm", "remove", "del"):
@@ -153,7 +138,7 @@ def _gguf_prepare(cfg: Config, model: str, quant: str | None = None):
     if {n.rsplit("/", 1)[-1] for n in names} <= have:
         ui.ok(f"GGUF {label} already on disk")
     else:
-        ui.info(f"Downloading GGUF {label} (via DoH-pinned DNS)")
+        ui.info(f"Downloading GGUF {label}")
         hf.download(model, cfg.hf_token, cfg.hf_hub, allow_patterns=names)
     path = hf.gguf_local_path(cfg.hf_hub, model, label)
     if path is None:
@@ -176,6 +161,8 @@ def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
             f"   port collision: mlx={cfg.mlx_port},"
             f" small={cfg.mlx_small_port}, proxy={cfg.proxy_port}"
             " — all three must differ (MLX_PORT / MLX_SMALL_PORT / PROXY_PORT)")
+    # whatever an interrupted run left on these ports must not hold RAM
+    servers.stop_stale(cfg)
     # GGUF repos run llama-server in the mlx slot; everything above the
     # port (proxy, clients, the desktop app) doesn't care which one it is.
     # A registered LoRA alias downloads its exact base and adapter instead
@@ -207,7 +194,7 @@ def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
                 ui.ok("already downloaded (completeness not verified —"
                       " HF API unreachable)")
             else:
-                ui.info("Downloading (via DoH-pinned DNS)")
+                ui.info("Downloading")
                 hf.download(model, cfg.hf_token, cfg.hf_hub)
                 ui.ok("download complete")
         elif missing:
@@ -228,7 +215,7 @@ def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
 
     if (not gguf_path
             and hf.packed_format(cfg.hf_hub, model) == "mlx-gsq-packed-v1"):
-        servers.ensure_gsq_runtime(cfg)
+        servers.ensure_gsq_runtime()
 
     # tiny helper model for fast/background calls — if it can't be fetched
     # (HF unreachable, cache cold) we degrade instead of blocking the stack:
@@ -259,15 +246,12 @@ def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
             except EOFError:
                 answer = ""
             if not answer.startswith("y"):
-                ui.ok("cancelled — free memory first (`local-llm stop` kills"
+                ui.ok("cancelled — free memory first (`local-llm stop` stops"
                       " leftovers)")
                 return False
         else:
             ui.warn("non-interactive start — continuing")
 
-    state = {"big": None, "small": None, "backend": backend,
-             "gguf_path": str(gguf_path) if gguf_path else None,
-             "lora_path": str(lora_path) if lora_path else None}
     max_input = hf.safe_context(cfg.hf_hub, weights_model,
                                 cfg.prompt_cache_bytes, cfg.max_ctx,
                                 kv_bits=cfg.kv_bits)
@@ -275,8 +259,10 @@ def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
         ui.info(f"model context capped at {max_input} tokens"
                 " (prompt-cache budget) — oversized requests are refused,"
                 " clients compact before it OOMs")
+    state = {"big": None, "small": None, "backend": backend,
+             "gguf_path": str(gguf_path) if gguf_path else None,
+             "lora_path": str(lora_path) if lora_path else None}
     servers.start_proxy(cfg, model, small_ok)
-
     state["big"] = (servers.start_llama(cfg, state["gguf_path"], model,
                                         max_input, state["lora_path"])
                     if gguf_path
@@ -290,24 +276,22 @@ def _boot(cfg: Config, model: str, quant: str | None = None) -> bool:
     servers.supervise(cfg, model, state, max_input=max_input)
     print()
     ui.info(f"Ready. OpenAI and Anthropic APIs on"
-            f" http://127.0.0.1:{cfg.proxy_port}")
-    print(f"  pi:      pi --model ollmlx/local   ({model})")
-    print(f"  omp:     omp --model ollmlx/local   ({model})")
-    print(f"  opencode: opencode --model ollmlx/local   ({model})")
-    print(f"  claude:  claude --settings {cfg.claude_cfg}")
+            f" http://{HOST}:{cfg.proxy_port}")
+    print(f"  pi:       pi --model ollmlx/local   ({model})")
+    print(f"  omp:      omp --model ollmlx/local")
+    print(f"  opencode: opencode --model ollmlx/local")
+    print(f"  claude:   claude --settings {cfg.claude_cfg}")
     if small_ok:
-        print(f"  fast/bg: ollmlx/small  ({cfg.small_model} on"
+        print(f"  fast/bg:  ollmlx/small  ({cfg.small_model} on"
               f" :{cfg.mlx_small_port} — titles, quick asks)")
-    print()
     return True
 
 
 def run_serve(cfg: Config, model: str, quant: str | None = None) -> int:
-    """The stack in the foreground, for terminals and bots/cron: same boot
-    as the desktop app (quant pick, servers, proxy, client configs,
-    watchdog), then blocks until SIGTERM or SIGINT and stops the children
-    cleanly. Port collisions and other startup failures exit non-zero
-    without killing a foreign stack."""
+    """The stack in the foreground, for terminals and the app alike: same
+    boot (quant pick, servers, proxy, client configs, watchdog), then blocks
+    until SIGTERM or SIGINT and stops the children cleanly. Port collisions
+    and other startup failures exit non-zero."""
     stop = threading.Event()
 
     def _signal(_signum, _frame):
@@ -327,7 +311,7 @@ def run_serve(cfg: Config, model: str, quant: str | None = None) -> int:
         return 0
     log.info("serve: stack ready (%s) — waiting for SIGTERM/SIGINT", model)
     print(f"serve: ready — model {model}; OpenAI/Anthropic on"
-          f" http://127.0.0.1:{cfg.proxy_port}; stop with Ctrl-C or SIGTERM",
+          f" http://{HOST}:{cfg.proxy_port}; stop with Ctrl-C or SIGTERM",
           flush=True)
     try:
         stop.wait()
@@ -340,9 +324,16 @@ def run_serve(cfg: Config, model: str, quant: str | None = None) -> int:
     return 0
 
 
+def cmd_stop(cfg: Config) -> int:
+    ui.info("Stopping leftover servers")
+    ui.ok("servers stopped" if servers.stop_stale(cfg)
+          else "no servers of the stack were running")
+    return 0
+
+
 def cmd_token(cfg: Config, args: list[str]) -> int:
     """Show/save/clear the HF token. Precedence: env HF_TOKEN > file."""
-    token_file = cfg.ollmlx_home / "hf-token"
+    token_file = cfg.home / "hf-token"
     if args and args[0] == "--clear":
         if token_file.exists():
             token_file.unlink()
@@ -351,7 +342,7 @@ def cmd_token(cfg: Config, args: list[str]) -> int:
             ui.ok("there was no saved token")
         return 0
     if args:
-        cfg.ollmlx_home.mkdir(parents=True, exist_ok=True)
+        cfg.home.mkdir(parents=True, exist_ok=True)
         token_file.write_text(args[0].strip() + "\n")
         token_file.chmod(0o600)
         ui.ok(f"token saved to {token_file} (chmod 600)")
@@ -361,7 +352,7 @@ def cmd_token(cfg: Config, args: list[str]) -> int:
         ui.warn("no token set: local-llm token <hf_...> or env HF_TOKEN")
         return 0
     from_env = bool(os.environ.get("HF_TOKEN") or
-                    os.environ.get("HUGGINGFACE_HUB_TOKEN"))
+                     os.environ.get("HUGGINGFACE_HUB_TOKEN"))
     src = "env HF_TOKEN" if from_env else str(token_file)
     masked = f"{token[:5]}…{token[-4:]}" if len(token) > 12 else "…"
     ui.info(f"HF token: {masked} (source: {src})")
@@ -373,16 +364,16 @@ def cmd_list(cfg: Config) -> int:
     if not installed:
         ui.warn(f"No downloaded LLM models ({cfg.hf_hub})")
         return 0
-    lf = llmfit.load(cfg.ollmlx_home) or {}
+    lf = llmfit.load(cfg.home) or {}
     sys_ram = ui.total_ram_gb()
     ui.info("💿 Installed models:")
     for rid, size, dling in installed:
         mark = "⬇ " if dling else "  "
-        e = lf.get(rid)
-        ram = models.ram_estimate_gb(rid, e, size=size)
+        entry = lf.get(rid)
+        ram = models.ram_estimate_gb(rid, entry, size=size)
         moe = " · MoE" if models.parse_model(rid)[4] else ""
-        ctx = llmfit.ctx_str(e) if e else None
-        lfsc = llmfit.score(e, sys_ram) if e else None
+        ctx = llmfit.ctx_str(entry) if entry else None
+        lfsc = llmfit.score(entry, sys_ram) if entry else None
         extra = (f" · ctx {ctx}" if ctx else "")
         extra += f" · ⚡{lfsc['score']:.0f}" if lfsc else ""
         extra += " · 🔒 helper" if rid == cfg.small_model else ""
@@ -394,18 +385,17 @@ def cmd_list(cfg: Config) -> int:
 
 def cmd_rm(cfg: Config, args: list[str]) -> int:
     installed = hf.scan_installed(cfg.hf_hub)
-    ids = [t[0] for t in installed]
     if not installed:
         ui.warn(f"No downloaded LLM models ({cfg.hf_hub})")
         return 0
+    ids = [t[0] for t in installed]
 
     if args:
         targets = list(args)
     else:
         ui.info("💿 Installed models:")
         for n, (rid, size, dling) in enumerate(installed, 1):
-            mark = "⬇ " if dling else "  "
-            print(f"  {n:2d}) {mark}{rid:<60} {size}")
+            print(f"  {n:2d}) {'⬇ ' if dling else '  '}{rid:<60} {size}")
         try:
             raw = input("?# Delete (numbers or org/repo, space-separated,"
                         " empty — cancel): ").strip()

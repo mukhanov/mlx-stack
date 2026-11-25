@@ -10,7 +10,6 @@ it there: no silent upgrades, re-download only when the pin is missing.
 The binary needs its dylibs next to it (rpath-relative), so the whole
 extracted directory is kept, versioned by build id."""
 import json
-import os
 import shutil
 import struct
 import tarfile
@@ -87,11 +86,11 @@ def _download_build(root: Path) -> str:
     return str(server)
 
 
-def ensure_llama_server(override: str = "") -> str:
-    """Absolute path to a llama-server binary: the explicit override >
-    OLLMLX_LLAMA_SERVER > PATH > the managed download under
-    ~/.mlx-stack/llama.cpp (pinned to the build recorded in build.txt)."""
-    override = override or os.environ.get("OLLMLX_LLAMA_SERVER", "")
+def ensure_llama_server(override: str) -> str:
+    """Absolute path to a llama-server binary: the path from
+    OLLMLX_LLAMA_SERVER when it names a file > one on PATH > the managed
+    download under ~/.mlx-stack/llama.cpp (pinned to the build recorded in
+    build.txt)."""
     if override:
         p = Path(override).expanduser()
         if p.is_file():
