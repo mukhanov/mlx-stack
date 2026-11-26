@@ -73,7 +73,7 @@ class LocalAPITests(unittest.TestCase):
         self.assertGreater(snapshot["memory"]["total"], 0)
         self.assertGreater(len(snapshot["cpu"]["cores"]), 0)
         self.assertEqual({c["name"] for c in snapshot["clients"]},
-                         {"pi", "omp", "opencode", "claude"})
+                         {"pi", "omp", "opencode", "claude", "dsh"})
 
     def test_localhost_is_as_good_a_name_for_this_machine(self):
         status, _ = self.call("GET", "/snapshot",

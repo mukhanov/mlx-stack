@@ -110,7 +110,7 @@ class ConfigHomeTests(unittest.TestCase):
         cfg = Config.from_env()
         settings = clients.client_configs(cfg)
         self.assertEqual({item["name"] for item in settings},
-                         {"pi", "omp", "opencode", "claude"})
+                         {"pi", "omp", "opencode", "claude", "dsh"})
         for item in settings:
             self.assertTrue(item["config_path"].startswith(str(self.stack)))
             self.assertIn("127.0.0.1", item["api_base"])
@@ -164,6 +164,25 @@ class ConfigHomeTests(unittest.TestCase):
         clients.write_client_configs(cfg, "org/model", small=False, max_input=8192)
         self.assertTrue(external.is_symlink())
         self.assertEqual(external.read_text(), text)
+
+    def test_the_dsh_overlay_declares_the_proxy_as_a_custom_model_api(self):
+        cfg = Config.from_env()
+        with patch.object(clients.hf, "model_ctx", return_value=40960):
+            clients.write_client_configs(cfg, "org/model", small=True, max_input=8192)
+        overlay = (self.stack / "configs" / "dsh-ollmlx.yml").read_text()
+        self.assertIn("id: llm-pi-ai", overlay)
+        self.assertIn("api: openai-completions", overlay)
+        self.assertIn("baseURL: http://127.0.0.1:4000/v1", overlay)
+        self.assertIn("Authorization: Bearer sk-local-llm", overlay)
+        for model in ("org/model", "local", "small"):
+            self.assertIn(f"- id: {model}\n", overlay)
+        self.assertIn("contextWindow: 8192", overlay)
+        self.assertIn("contextWindow: 40960", overlay)   # the helper's own window
+        # dsh's own configuration is left alone: only the overlay is written
+        self.assertFalse((self.home / ".dsh").exists())
+        command = next(item["command"] for item in clients.client_configs(cfg)
+                       if item["name"] == "dsh")
+        self.assertEqual(command, "dsh web --patch ~/.mlx-stack/configs/dsh-ollmlx.yml")
 
     def test_model_settings_override_the_stack_wide_ones_and_round_trip(self):
         cfg = Config.from_env()

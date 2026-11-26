@@ -1,6 +1,7 @@
 """Client configs: pi/omp (models.json, provider "ollmlx"), opencode
-(provider merged into opencode.json) and claude (claude.json with env
-pointing at the client proxy). Canonical copies live in ~/.mlx-stack/configs;
+(provider merged into opencode.json), claude (claude.json with env
+pointing at the client proxy) and dsh (an overlay declaring the proxy as a
+custom model API). Canonical copies live in ~/.mlx-stack/configs;
 the harness's own path is a symlink so the tool keeps reading its expected
 file."""
 import json
@@ -155,6 +156,7 @@ def write_client_configs(cfg, model: str, small: bool, max_input: int) -> None:
         ui.ok(f"{omp_cache} (cached)")
     _write_omp_smol_role(cfg, small)
     _write_opencode(cfg, model, small, ctx)
+    _write_dsh(cfg, model, small, ctx)
 
     cfg.claude_cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.claude_cfg.write_text(json.dumps({
@@ -214,6 +216,43 @@ def _write_opencode(cfg, model: str, small: bool, ctx: int) -> None:
     ui.ok(str(external).replace(str(Path.home()), "~"))
 
 
+def _write_dsh(cfg, model: str, small: bool, ctx: int) -> None:
+    """DeepSeek Harness: an overlay that adds the proxy as a custom model
+    API provider (llm-pi-ai). Applied with --patch, so dsh's own
+    cordis.patch.yml is never rewritten. The static local key travels as an
+    Authorization header, so no environment variable is needed."""
+    entries = [(model, f"{model.split('/')[-1]} (local MLX)", ctx),
+               (LOCAL_ALIAS, "Local MLX (whatever is running)", ctx)]
+    if small:
+        entries.append((SMALL_ALIAS, "Local MLX small — fast helper"
+                        " (background calls, titles)",
+                        hf.model_ctx(cfg.hf_hub, cfg.small_model)))
+    models = "\n".join(
+        f"          - id: {mid}\n"
+        f"            name: {name}\n"
+        f"            contextWindow: {window}\n"
+        f"            maxTokens: {min(window, 32768)}\n"
+        f"            input: [text]"
+        for mid, name, window in entries)
+    target = cfg.home / "configs" / "dsh-ollmlx.yml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"""# MLX Stack as a custom model API in DeepSeek Harness.
+# Apply with: dsh web --patch {str(target).replace(str(Path.home()), "~")}
+- id: llm-pi-ai
+  config:
+    providers:
+      ollmlx:
+        api: openai-completions
+        baseURL: http://{HOST}:{cfg.proxy_port}/v1
+        headers:
+          # the proxy's static local key; no environment variable is needed
+          Authorization: Bearer {cfg.api_key}
+        models:
+{models}
+""")
+    ui.ok(str(target))
+
+
 def client_configs(cfg) -> list[dict]:
     """Connection parameters for the Tools screen and the snapshot."""
     home = str(Path.home())
@@ -236,4 +275,9 @@ def client_configs(cfg) -> list[dict]:
          "config_path": str(cfg.claude_cfg),
          "api_base": f"http://{HOST}:{cfg.proxy_port}",
          "model": LOCAL_ALIAS, "role": "Anthropic-compatible settings"},
+        {"name": "dsh", "command":
+            f"dsh web --patch {str(cfg.home / 'configs' / 'dsh-ollmlx.yml').replace(home, '~')}",
+         "config_path": str(cfg.home / "configs" / "dsh-ollmlx.yml"),
+         "api_base": base, "model": LOCAL_ALIAS,
+         "role": "Custom model API (llm-pi-ai overlay)"},
     ]

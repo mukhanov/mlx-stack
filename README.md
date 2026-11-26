@@ -70,7 +70,7 @@ Only harness traffic is counted; the watchdog and warm-up probes are excluded. A
 
 ## Tools
 
-- Connection settings for pi, omp, opencode and Claude Code: launch command, endpoint, model alias and the canonical config path, with *Show in Finder* and *Copy path*.
+- Connection settings for pi, omp, opencode, Claude Code and dsh: launch command, endpoint, model alias and the canonical config path, with *Show in Finder* and *Copy path*.
 - The stack's own files: model defaults, global context limits, omp roles, the Hugging Face token and the logs folder.
 
 ⌘1, ⌘2 and ⌘3 switch between Models, Monitor and Tools. Closing the window keeps the app in the status bar; **Exit** in its menu stops the models and quits.
@@ -85,8 +85,9 @@ Loading a model writes the harness configuration and points every harness at the
 | omp | `omp --model ollmlx/local` | `~/.omp/agent/models.json` and `~/.omp/agent/config.yml` |
 | opencode | `opencode --model ollmlx/local` | `~/.config/opencode/opencode.json` |
 | Claude Code | `claude --settings ~/.mlx-stack/configs/claude.json` | `~/.mlx-stack/configs/claude.json` |
+| dsh (DeepSeek Harness) | `dsh web --patch ~/.mlx-stack/configs/dsh-ollmlx.yml` | `~/.mlx-stack/configs/dsh-ollmlx.yml` |
 
-Each harness file is a symlink to its canonical copy in `~/.mlx-stack/configs`; a file that already exists is copied there first.
+Each harness file is a symlink to its canonical copy in `~/.mlx-stack/configs`; a file that already exists is copied there first. dsh is different: the overlay only adds a provider, so nothing in `$DSH_HOME` is rewritten. It declares the custom provider `ollmlx` with the OpenAI Chat Completions protocol, the base URL and the local key as an `Authorization` header — no environment variable needed. The same values can be entered in dsh's Web UI via **Settings → Models → Add model provider → Custom model API**.
 
 The proxy speaks both APIs:
 
