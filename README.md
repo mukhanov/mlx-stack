@@ -15,6 +15,22 @@ flowchart LR
 
 All four services bind to `127.0.0.1` only. The local API and the client proxy also answer a request only when it addresses this machine by name and does not come from a web page, so a site open in a browser cannot load, stop or delete models through them. The two model servers take no key: any program run by your user can call them on their ports.
 
+## What it looks like
+
+One glance at what the model is doing and what it costs the machine.
+
+![Monitor: decode rate, context and system load](docs/monitor.png)
+
+**Monitor** — decode rate over the last four minutes with an activity band (generating, reading the prompt, waiting for the client), context against its cap, time to first token and uncached tokens, plus CPU, RAM and swap. Refreshes once a second; the Main/Small switch picks which model you are watching.
+
+![Models: the model manager](docs/models.png)
+
+**Models** — the catalog with a hardware-fit score for this Mac, the RAM each model needs and its estimated speed, and everything that is downloaded with size and context. Downloads run in the background with pause/resume, and a load in progress shows its stage and the weights coming into memory instead of leaving you guessing.
+
+![Tools: harness settings](docs/tools.png)
+
+**Tools** — every harness in one place: its launch command, endpoint and model alias, the canonical config file with *Copy command*, *Show in Finder* and *Copy path*, and below them the stack's own settings and logs. Loading a model writes all of it for you.
+
 ## Install
 
 ```console
