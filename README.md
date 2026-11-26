@@ -1,6 +1,10 @@
 # MLX Stack
 
-Native macOS menu-bar app that runs a local LLM on Apple Silicon through [MLX](https://github.com/ml-explore/mlx-lm) or [llama.cpp](https://github.com/ggml-org/llama.cpp) and hands it to coding agents over localhost. The Python backend is part of this repository and ships inside the app; nothing else needs to be installed.
+[![Release](https://img.shields.io/github/v/release/mukhanov/mlx-stack)](https://github.com/mukhanov/mlx-stack/releases) [![Homebrew cask](https://img.shields.io/badge/homebrew-cask-blue)](https://github.com/mukhanov/homebrew-local-llm) [![Platform](https://img.shields.io/badge/macOS%2014%2B-Apple%20Silicon-blue)](#install) [![Tests](https://img.shields.io/badge/tests-93%20passing-brightgreen)](#tests) [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+
+Turn an Apple Silicon Mac into a local AI coding server. MLX Stack is a native macOS menu-bar app that runs models through [MLX](https://github.com/ml-explore/mlx-lm) or [llama.cpp](https://github.com/ggml-org/llama.cpp), connects them to coding agents over localhost and shows their speed, context and memory use. The Python backend and `uv` ship inside the app; separate Python and `uv` installations are not required. Models and coding-agent CLIs are not bundled.
+
+Why this instead of a plain server: per-model launches sized against your free RAM with a live memory forecast, OpenAI and Anthropic endpoints with model aliases, generated configs for the agents you actually use, a real loading progress bar, and no telemetry from MLX Stack.
 
 ```mermaid
 flowchart LR
@@ -13,7 +17,7 @@ flowchart LR
     W -.-> S
 ```
 
-All four services bind to `127.0.0.1` only. The local API and the client proxy also answer a request only when it addresses this machine by name and does not come from a web page, so a site open in a browser cannot load, stop or delete models through them. The two model servers take no key: any program run by your user can call them on their ports.
+All four services bind to `127.0.0.1` only. The local API rejects requests with a browser `Origin` or a non-local `Host`, so a web page cannot use it to load, stop or delete models. The client proxy checks `Host` and requires its local key except on health endpoints. The two model servers take no key: any local process that can reach their ports can call them. Loopback binding is not a security boundary between users of the same Mac.
 
 ## What it looks like
 
@@ -33,6 +37,8 @@ One glance at what the model is doing and what it costs the machine.
 
 ## Install
 
+Requirements: macOS 14 or later on Apple Silicon, and a Homebrew version with the `brew trust` command.
+
 ```console
 brew tap mukhanov/local-llm
 brew trust mukhanov/local-llm
@@ -42,14 +48,28 @@ open -a "MLX Stack"
 
 The cask puts `MLX Stack.app` in `/Applications`. The backend and `uv` travel inside the bundle; no Python installation or terminal setup is needed.
 
-On first launch the app creates `~/.mlx-stack/mlx-stack-venv` and installs the backend's Python dependencies, which needs internet access once. An existing `~/.ollmlx` is migrated to `~/.mlx-stack` and kept as a compatibility symlink.
+Prefer a file? Download [`releases/MLXStack-v0.1.6.zip`](https://raw.githubusercontent.com/mukhanov/mlx-stack/v0.1.6/releases/MLXStack-v0.1.6.zip) and unzip it into `/Applications`. Current releases are ad-hoc signed, not Developer ID signed or notarized, so macOS Gatekeeper can warn about or block the app.
 
-The backend needs three Python packages — `mlx-lm`, `huggingface-hub` and `psutil` — and otherwise only the standard library. GGUF models fetch a `llama-server` build on first use.
+On first launch the app creates `~/.mlx-stack/mlx-stack-venv`, obtains Python 3.12 if needed and installs the backend's dependencies. A fresh setup needs internet access; catalog refreshes, model downloads and managed backend downloads need it later too. An existing `~/.ollmlx` is migrated to `~/.mlx-stack` and kept as a compatibility symlink.
+
+The backend declares three direct Python dependencies — `mlx-lm`, `huggingface-hub` and `psutil` — and their transitive dependencies are installed into the private environment.
+
+## Quickstart
+
+1. Open **Models**, download an MLX or GGUF model that fits your available memory and choose **Load…**. The first download can be large.
+2. Review the launch parameters and load the model. MLX Stack starts the main and helper model servers and the client proxy, then writes the supported harness configurations described below.
+3. Start an installed coding agent. For example, with omp installed:
+
+   ```console
+   omp --model ollmlx/local
+   ```
+
+   Commands and configuration paths for pi, opencode, Claude Code and dsh are in [Use with coding agents](#use-with-coding-agents) and in the app's **Tools** screen.
 
 ## Models
 
-- Browse what is downloaded or search Hugging Face, by format (MLX or GGUF) and by author (mlx-community or everyone), sorted by fit score or by downloads. Each row shows size, downloads, likes and the hardware fit for this Mac: score, quality, speed, context and estimated tokens per second.
-- MLX repositories are served by `mlx_lm.server`. GGUF repositories are served by llama.cpp's `llama-server`, which is downloaded on first use and pinned under `~/.mlx-stack/llama.cpp`.
+- Browse what is downloaded or search Hugging Face, by format (MLX or GGUF) and by author (mlx-community or everyone), sorted by fit score or by downloads. Each row shows size, downloads, likes and the hardware fit for this Mac: score, quality, speed, context and estimated tokens per second. These values are heuristics, not measured benchmarks.
+- MLX repositories are served by `mlx_lm.server`. GGUF repositories are served by llama.cpp's `llama-server`; a macOS arm64 build is selected from GitHub releases on first use and cached by build tag under `~/.mlx-stack/llama.cpp`.
 - Downloads run in the background while the loaded models keep serving. They show percentage, bytes and speed, can be paused, resumed and cancelled, and resume after a restart.
 - Deleted models are remembered and marked in the catalog; they come back only through an explicit download.
 - **Load…** opens the launch parameters: context and prompt cache sized against a shared RAM budget, KV-cache quantization, sampling (temperature, top-p, top-k, min-p), max tokens and the load and client timeouts, with a live forecast of memory use once the cache is full. They are saved per model in `~/.mlx-stack/model-settings.json`; **Defaults** returns to the stack-wide values.
@@ -77,7 +97,7 @@ Only harness traffic is counted; the watchdog and warm-up probes are excluded. A
 
 ## Use with coding agents
 
-Loading a model writes the harness configuration and points every harness at the client proxy on `127.0.0.1:4000`:
+Loading a model writes the supported harness configuration and points the agents at the client proxy on `127.0.0.1:4000`:
 
 | Harness | Start | Configuration |
 |---|---|---|
@@ -87,7 +107,11 @@ Loading a model writes the harness configuration and points every harness at the
 | Claude Code | `claude --settings ~/.mlx-stack/configs/claude.json` | `~/.mlx-stack/configs/claude.json` |
 | dsh (DeepSeek Harness) | `dsh web --patch ~/.mlx-stack/configs/dsh-ollmlx.yml` | `~/.mlx-stack/configs/dsh-ollmlx.yml` |
 
-Each harness file is a symlink to its canonical copy in `~/.mlx-stack/configs`; a file that already exists is copied there first. dsh is different: the overlay only adds a provider, so nothing in `$DSH_HOME` is rewritten. It declares the custom provider `ollmlx` with the OpenAI Chat Completions protocol, the base URL and the local key as an `Authorization` header — no environment variable needed. The same values can be entered in dsh's Web UI via **Settings → Models → Add model provider → Custom model API**.
+For pi, omp and opencode, the harness path becomes a symlink to its canonical copy in `~/.mlx-stack/configs`; an existing regular file is copied there on first setup. Other settings in plain JSON are preserved, while MLX Stack updates its own provider entries. opencode JSONC is left unchanged, and a non-standard omp `modelRoles` layout needs manual editing. Claude Code uses a generated file in the canonical directory.
+
+There is no configuration preview or one-click rollback. Back up existing agent configurations before the first model load.
+
+dsh is different: the overlay only adds a provider, so nothing in `$DSH_HOME` is rewritten. It declares the custom provider `ollmlx` with the OpenAI Chat Completions protocol, the base URL and the local key as an `Authorization` header — no environment variable needed. The same values can be entered in dsh's Web UI via **Settings → Models → Add model provider → Custom model API**.
 
 ![dsh's model picker with MLX Stack as a provider](docs/dsh-provider.png)
 
@@ -98,10 +122,19 @@ The proxy speaks both APIs:
 | OpenAI | `POST /v1/chat/completions`, `GET /v1/models` | pi, omp, opencode |
 | Anthropic | `POST /v1/messages` | Claude Code |
 
-- Model names: `local` is the loaded main model, `small` the helper. Any other name is refused with `404`, because the model server would otherwise load whatever repository a request names.
-- Anthropic requests are translated to chat completions, streaming and tool use included.
+- Model names: `local` is an alias for the loaded main model and `small` for the helper. The full repository names of the loaded models are also accepted. Any other name is refused with `404`, because the model server would otherwise load whatever repository a request names.
+- Anthropic requests are translated to chat completions, streaming and tool use included. Actual tool-use support depends on the loaded model and the harness.
 - Send the key from the harness configs as `Authorization: Bearer …` or `x-api-key`.
 - The helper model (`mlx-community/Qwen3-0.6B-4bit` by default, override with `OLLMLX_SMALL_MODEL`) answers short background calls so they do not queue behind the main model.
+
+## Privacy and limits
+
+- MLX Stack's proxy and model traffic stays on loopback; it does not use a hosted inference API. Coding agents are separate programs and can have their own telemetry, update checks or other network traffic.
+- Dependency installation contacts Python package indexes. Model search and downloads contact Hugging Face; its DNS fallback can contact Cloudflare's `1.1.1.1` DNS-over-HTTPS service. The hardware catalog comes from the llmfit repository on GitHub. Managed llama.cpp and optional model-runtime downloads also contact GitHub. An optional Hugging Face token is used for Hugging Face requests.
+- Only the chat/model API operations listed above are documented; this is not a complete implementation of every OpenAI or Anthropic API endpoint.
+- Fit scores, RAM forecasts and estimated tokens per second are guidance, not reproducible performance measurements. Model size, available memory, context length and cache settings can prevent a model from loading or serving a session.
+- The managed llama.cpp build is chosen when first needed rather than fixed by the MLX Stack release. For a custom, already installed server, set `OLLMLX_LLAMA_SERVER`.
+- The app is local-only and is not designed to expose models to other machines or to isolate multiple local users.
 
 ## Backend without the app
 
@@ -141,7 +174,7 @@ Ports and limits are set with environment variables. In the app, the launch para
 ├── configs/                harness configuration, canonical copies
 ├── logs/                   app.log, mlx-stack.log, mlx-server.log, mlx-small.log,
 │                           proxy.log, mlx-watchdog.log, llama-server.log
-├── llama.cpp/              pinned llama-server build for GGUF models
+├── llama.cpp/              cached llama-server builds for GGUF models
 ├── model-settings.json     launch parameters per model
 ├── context-settings.json   stack-wide context and prompt-cache limits
 ├── launch.json             stage of the model being loaded, removed when it serves
@@ -157,11 +190,11 @@ Server and proxy logs keep the previous run as `.log.1`.
 Requirements: macOS 14+, Apple Silicon, Swift Command Line Tools and [uv](https://docs.astral.sh/uv/). The build bundles `uv` into the app.
 
 ```console
-./build.sh 0.1.5
+./build.sh 0.1.6
 open "build/MLX Stack.app"
 ```
 
-The script compiles the Swift sources in `Sources/`, copies the backend from `Backend/`, signs the bundle and writes `releases/MLXStack-v0.1.5.zip`, the artifact the Homebrew cask installs.
+The script compiles the Swift sources in `Sources/`, copies the backend from `Backend/`, ad-hoc signs the bundle and writes `releases/MLXStack-v0.1.6.zip`, the artifact the Homebrew cask installs. It does not notarize the app or generate a checksum manifest; the cask separately pins the release archive's SHA-256.
 
 ## Tests
 
