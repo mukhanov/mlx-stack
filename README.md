@@ -1,6 +1,6 @@
 # MLX Stack
 
-[![Release](https://img.shields.io/github/v/release/mukhanov/mlx-stack)](https://github.com/mukhanov/mlx-stack/releases) [![Homebrew cask](https://img.shields.io/badge/homebrew-cask-blue)](https://github.com/mukhanov/homebrew-local-llm) [![Platform](https://img.shields.io/badge/macOS%2014%2B-Apple%20Silicon-blue)](#install) [![Tests](https://img.shields.io/badge/tests-93%20passing-brightgreen)](#tests) [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![Release](https://img.shields.io/github/v/release/mukhanov/mlx-stack)](https://github.com/mukhanov/mlx-stack/releases) [![Homebrew cask](https://img.shields.io/badge/homebrew-cask-blue)](https://github.com/mukhanov/homebrew-mlx-stack) [![Platform](https://img.shields.io/badge/macOS%2014%2B-Apple%20Silicon-blue)](#install) [![Tests](https://img.shields.io/badge/tests-93%20passing-brightgreen)](#tests) [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
 
 Turn an Apple Silicon Mac into a local AI coding server. MLX Stack is a native macOS menu-bar app that runs models through [MLX](https://github.com/ml-explore/mlx-lm) or [llama.cpp](https://github.com/ggml-org/llama.cpp), connects them to coding agents over localhost and shows their speed, context and memory use. The Python backend and `uv` ship inside the app; separate Python and `uv` installations are not required. Models and coding-agent CLIs are not bundled.
 
@@ -40,8 +40,8 @@ One glance at what the model is doing and what it costs the machine.
 Requirements: macOS 14 or later on Apple Silicon, and a Homebrew version with the `brew trust` command.
 
 ```console
-brew tap mukhanov/local-llm
-brew trust mukhanov/local-llm
+brew tap mukhanov/mlx-stack
+brew trust mukhanov/mlx-stack
 brew install --cask mlx-stack
 open -a "MLX Stack"
 ```
