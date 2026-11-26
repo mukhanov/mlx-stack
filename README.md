@@ -89,6 +89,8 @@ Loading a model writes the harness configuration and points every harness at the
 
 Each harness file is a symlink to its canonical copy in `~/.mlx-stack/configs`; a file that already exists is copied there first. dsh is different: the overlay only adds a provider, so nothing in `$DSH_HOME` is rewritten. It declares the custom provider `ollmlx` with the OpenAI Chat Completions protocol, the base URL and the local key as an `Authorization` header — no environment variable needed. The same values can be entered in dsh's Web UI via **Settings → Models → Add model provider → Custom model API**.
 
+![dsh's model picker with MLX Stack as a provider](docs/dsh-provider.png)
+
 The proxy speaks both APIs:
 
 | API | Endpoints | Used by |
