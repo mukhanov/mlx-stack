@@ -235,7 +235,7 @@ class StackController:
     def can_switch(self):
         return self.running or not monitor.port_ok(self.cfg.mlx_port)
 
-    def start(self, model):
+    def start(self, model, config_write_consent=False):
         with self.lock:
             if self.downloads and self.downloads.active(model):
                 return 409, {"error": "wait for the download to finish"}
@@ -243,6 +243,9 @@ class StackController:
                 return 400, {"error": "model is not fully downloaded"}
             if self.running and self.current == model:
                 return 202, {"model": model}
+            if not config_write_consent:
+                return 409, {"error": "review and approve agent configuration"
+                                      " changes before loading a model"}
             if monitor.port_ok(self.cfg.mlx_port) and not self.running:
                 return 409, {"error": "stop the terminal stack before switching"}
             if not self._stop():
@@ -251,7 +254,8 @@ class StackController:
                                             self.cfg.model_settings(model))
             env = {**os.environ, **self.cfg.model_environment(model, settings)}
             self.proc = subprocess.Popen(
-                [sys.executable, "-m", "local_llm", "serve", model], env=env)
+                [sys.executable, "-m", "local_llm", "serve", model,
+                 "--approve-configs"], env=env)
             self.current = model
             return 202, {"model": model}
 
@@ -580,6 +584,7 @@ def _context_settings(cfg, model) -> dict:
         "budget_available_bytes": available + reclaimable,
         "weights_bytes": hf.model_disk_bytes(cfg.hf_hub, model),
         "cache_limit_bytes": hf.memory_cache_limit(cfg.hf_hub, model, freed),
+        "config_preview": clients.config_preview(cfg),
     }
 
 
@@ -681,6 +686,7 @@ def snapshot(cfg, controller) -> dict:
         "small": (_perf(servers.MLX_SMALL_LOG, controller.request_tracker)
                   if small_up else None),
         "clients": clients.client_configs(cfg),
+        "config_backup": clients.latest_config_backup(cfg),
         "logs": log_rows,
     }
 
@@ -757,7 +763,8 @@ def _make_server(cfg, controller, downloads) -> ThreadingHTTPServer:
             if not self._trusted():
                 return
             if self.path not in ("/run", "/delete", "/download", "/pause",
-                                 "/resume", "/cancel", "/settings", "/stop"):
+                                 "/resume", "/cancel", "/settings", "/stop",
+                                 "/rollback"):
                 self.send_error(404)
                 return
             try:
@@ -772,7 +779,14 @@ def _make_server(cfg, controller, downloads) -> ThreadingHTTPServer:
                 self.reply(400, {"error": "invalid JSON"})
                 return
             model = payload.get("model")
-            if self.path == "/settings":
+            if self.path == "/rollback":
+                try:
+                    restored = clients.rollback_latest_config_backup(cfg)
+                except (OSError, ValueError, SystemExit) as exc:
+                    self.reply(409, {"error": str(getattr(exc, "code", exc))})
+                else:
+                    self.reply(200, {"restored": restored})
+            elif self.path == "/settings":
                 try:
                     _update_context_settings(cfg, payload)
                 except ValueError as exc:
@@ -782,7 +796,8 @@ def _make_server(cfg, controller, downloads) -> ThreadingHTTPServer:
             elif not isinstance(model, str):
                 self.reply(400, {"error": "expected a model name"})
             elif self.path == "/run":
-                self.reply(*controller.start(model))
+                self.reply(*controller.start(
+                    model, payload.get("config_write_consent") is True))
             elif self.path == "/delete":
                 self.reply(*controller.delete(model))
             elif self.path == "/stop":

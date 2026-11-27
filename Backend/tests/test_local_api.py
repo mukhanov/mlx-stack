@@ -19,12 +19,12 @@ SNAPSHOT_KEYS = {
     "model", "small_model", "launch_error", "backend", "uptime_seconds",
     "max_input", "config_home", "available_models", "can_switch", "ports",
     "cpu", "memory", "swap", "processes", "process_summary", "top_eaters",
-    "main", "small", "clients", "logs",
+    "main", "small", "clients", "config_backup", "logs",
 }
 SETTINGS_KEYS = {
     "settings", "defaults", "kv_bytes_per_token", "effective_ctx", "model_ctx",
     "available_bytes", "reclaimable_bytes", "is_loaded", "budget_available_bytes",
-    "weights_bytes", "cache_limit_bytes",
+    "weights_bytes", "cache_limit_bytes", "config_preview",
 }
 
 
@@ -133,6 +133,22 @@ class LocalAPITests(unittest.TestCase):
                 status, body = self.call("POST", "/settings", payload)
                 self.assertEqual((status, body), (400, {"error": message}))
         self.assertFalse((self.cfg.home / "model-settings.json").exists())
+
+    def test_run_requires_explicit_config_consent(self):
+        previous = self.controller.models
+        self.controller.models = ["org/model"]
+        try:
+            status, body = self.call("POST", "/run", {"model": "org/model"})
+        finally:
+            self.controller.models = previous
+        self.assertEqual(status, 409)
+        self.assertIn("approve agent configuration", body["error"])
+        self.assertIsNone(self.controller.proc)
+
+    def test_rollback_without_a_backup_is_an_error(self):
+        status, body = self.call("POST", "/rollback", {})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "no agent configuration backups")
 
     def test_malformed_requests_are_rejected(self):
         conn = HTTPConnection(HOST, self.port, timeout=10)

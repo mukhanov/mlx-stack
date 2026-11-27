@@ -17,10 +17,12 @@ local-llm — the MLX Stack backend: a local model behind OpenAI and Anthropic
 APIs on localhost.
 
 Usage:
-  local-llm serve <org/model> [quant]   start the stack in the foreground
+  local-llm serve <org/model> [quant] [--approve-configs]
+                                        start the stack in the foreground
   local-llm <org/model> [quant]         the same, without "serve"
   local-llm list                        downloaded models, size and RAM estimate
   local-llm stop                        stop servers left over from an interrupted run
+  local-llm rollback [--yes]            restore the latest agent config backup
   local-llm rm [org/repo…]              delete downloaded models (prompts when
                                         called without arguments)
   local-llm token [hf_… | --clear]      show, save or clear the Hugging Face token
@@ -32,8 +34,10 @@ quantization — file name, quant name or a substring of it; the default is the
 largest that fits free RAM.
 
 serve fetches the model when it is missing, starts the model server (:19797),
-the helper model for fast calls (:8081) and the client proxy (:4000), points
-pi, omp, opencode and Claude Code at it, and runs until Ctrl-C or SIGTERM.
+the helper model for fast calls (:8081) and the client proxy (:4000), previews
+and backs up pi, omp, opencode and Claude Code settings before updating them,
+and runs until Ctrl-C or SIGTERM. Interactive starts ask before changing agent
+configs; non-interactive starts require --approve-configs.
 
 Environment: MLX_PORT, MLX_SMALL_PORT, PROXY_PORT, WIDGET_PORT,
 MLX_STACK_HOME, HF_HUB_CACHE, HF_TOKEN; launch settings MLX_MAX_CTX,
@@ -103,13 +107,22 @@ def main(argv: list[str] | None = None) -> int:
         if rest:
             raise SystemExit("   usage: local-llm widget")
         return widget.run(cfg)
+    if cmd == "rollback":
+        return cmd_rollback(cfg, rest)
     if cmd == "serve":
+        if "--approve-configs" in rest:
+            os.environ[clients.CONFIG_CONSENT_ENV] = "1"
+            rest = [arg for arg in rest if arg != "--approve-configs"]
         if not rest or "/" not in rest[0]:
-            raise SystemExit("   usage: local-llm serve <org/model> [quant]")
+            raise SystemExit(
+                "   usage: local-llm serve <org/model> [quant] [--approve-configs]")
         return run_serve(cfg, rest[0], rest[1] if len(rest) > 1 else None)
     if "/" in cmd:
         # second word (when given) is the GGUF quant: file name, quant name
         # or any substring of it — the boot sorts MLX vs GGUF out itself
+        if "--approve-configs" in rest:
+            os.environ[clients.CONFIG_CONSENT_ENV] = "1"
+            rest = [arg for arg in rest if arg != "--approve-configs"]
         return run_serve(cfg, cmd, rest[0] if rest else None)
     raise SystemExit(f"   unknown command '{cmd}' — see local-llm --help")
 
@@ -203,6 +216,13 @@ def _boot(cfg: Config, model: str, quant: str | None,
             f"   port collision: mlx={cfg.mlx_port},"
             f" small={cfg.mlx_small_port}, proxy={cfg.proxy_port}"
             " — all three must differ (MLX_PORT / MLX_SMALL_PORT / PROXY_PORT)")
+    if not clients.confirm_config_writes(cfg):
+        if not sys.stdin.isatty():
+            raise SystemExit(
+                "agent configuration approval required; "
+                "rerun with --approve-configs")
+        ui.ok("cancelled — no agent configuration changed")
+        return False
     progress.stage("prepare")
     # whatever an interrupted run left on these ports must not hold RAM
     servers.stop_stale(cfg)
@@ -295,9 +315,17 @@ def _boot(cfg: Config, model: str, quant: str | None,
         else:
             ui.warn("non-interactive start — continuing")
 
+    cache_limit = int(hf.memory_cache_limit(cfg.hf_hub, weights_model) * 0.95)
+    if cfg.prompt_cache_bytes > cache_limit:
+        ui.info(f"prompt cache capped at {ui.human_bytes(cache_limit)}"
+                " to fit available RAM")
+        cfg.prompt_cache_bytes = cache_limit
     max_input = hf.safe_context(cfg.hf_hub, weights_model,
                                 cfg.prompt_cache_bytes, cfg.max_ctx,
                                 kv_bits=cfg.kv_bits)
+    if max_input == 0:
+        raise SystemExit("not enough available RAM for a 4K context —"
+                         " close other apps or choose a smaller model")
     if max_input < hf.model_ctx(cfg.hf_hub, weights_model):
         ui.info(f"model context capped at {max_input} tokens"
                 " (prompt-cache budget) — oversized requests are refused,"
@@ -372,6 +400,29 @@ def run_serve(cfg: Config, model: str, quant: str | None = None) -> int:
         print("serve: stopping", flush=True)
         servers.stop_watchdog()
         servers.stop_children()
+    return 0
+
+
+def cmd_rollback(cfg: Config, args: list[str]) -> int:
+    if args not in ([], ["--yes"]):
+        raise SystemExit("   usage: local-llm rollback [--yes]")
+    latest = clients.latest_config_backup(cfg)
+    if latest is None:
+        raise SystemExit("no agent configuration backups")
+    ui.info(f"Latest agent config backup: {latest['created_at']}"
+            f" · {latest['model']}\n  {latest['path']}")
+    if "--yes" not in args:
+        if not sys.stdin.isatty():
+            raise SystemExit("rollback needs confirmation: local-llm rollback --yes")
+        try:
+            answer = input("Restore these agent configuration files? [y/N] ")
+        except EOFError:
+            answer = ""
+        if not answer.strip().lower().startswith("y"):
+            ui.ok("cancelled — agent configs unchanged")
+            return 0
+    restored = clients.rollback_latest_config_backup(cfg)
+    ui.ok(f"agent configs restored from {restored['path']}")
     return 0
 
 

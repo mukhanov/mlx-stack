@@ -38,19 +38,20 @@ if [ ! -x "$VENV/bin/python" ]; then
   rm -f "$STAMP"
 fi
 
-# The app installs a regular, non-editable wheel: no Cellar or source checkout
-# path can disappear after an upgrade. Hash every source file because app
-# updates can change Python code without changing its dependencies.
+# The app installs a regular, non-editable wheel from the locked dependency
+# set: no Cellar or source checkout path can disappear after an upgrade, and
+# an app release installs the same package versions every time. Hash sources
+# and the lockfile because either can change without changing the other.
 hash=$(
   {
     find "$APP_DIR/local_llm" -type f ! -name '*.pyc' \
       ! -path '*/__pycache__/*' -exec shasum -a 256 {} +
-    shasum -a 256 "$APP_DIR/pyproject.toml"
+    shasum -a 256 "$APP_DIR/pyproject.toml" "$APP_DIR/uv.lock"
   } | sort | shasum -a 256 | cut -d' ' -f1
 )
 if [ "$(cat "$STAMP" 2>/dev/null)" != "$hash" ]; then
-  "$UV" pip install --python "$VENV/bin/python" \
-    --reinstall-package local-llm "$APP_DIR"
+  UV_PROJECT_ENVIRONMENT="$VENV" "$UV" sync --project "$APP_DIR" \
+    --locked --no-dev --no-editable
   printf '%s\n' "$hash" > "$STAMP"
 fi
 

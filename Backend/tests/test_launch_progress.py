@@ -240,11 +240,71 @@ class BootStagesTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for stub in stubs:
                 stack.enter_context(stub)
+            stack.enter_context(patch.dict(
+                os.environ, {cli.clients.CONFIG_CONSENT_ENV: "1"}))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             booted = cli._boot(cfg, MODEL, None, Recorder(cfg, MODEL))
         self.assertTrue(booted)
         self.assertEqual(Recorder.heard, ["prepare", "weights", "helper", "warmup"])
         self.assertFalse((home / "launch.json").exists())   # the stack serves
+
+    def test_a_noninteractive_boot_needs_config_approval(self):
+        cfg = SimpleNamespace(mlx_port=19797, mlx_small_port=8081, proxy_port=4000)
+        with patch.object(cli.clients, "confirm_config_writes", return_value=False), \
+                patch.object(cli.sys.stdin, "isatty", return_value=False), \
+                patch.object(cli.servers, "stop_stale") as stop_stale, \
+                self.assertRaisesRegex(SystemExit, "--approve-configs"):
+            cli._boot(cfg, MODEL, None, SimpleNamespace())
+        stop_stale.assert_not_called()
+
+    def test_boot_clamps_prompt_cache_and_refuses_zero_context(self):
+        def exercise(available):
+            home = Path(tempfile.mkdtemp(prefix="mlx-stack-launch-test-"))
+            self.addCleanup(lambda: os.system(f"rm -rf {home}"))
+            cfg = SimpleNamespace(home=home, hf_hub=home / "hub", hf_token=None,
+                                  mlx_port=19797, mlx_small_port=8081, proxy_port=4000,
+                                  prompt_cache_bytes=16 * GB, max_ctx=40960, kv_bits=0,
+                                  small_model="org/small", claude_cfg="claude.json")
+            configs = []
+            nothing = lambda *_, **__: None
+            stubs = [
+                patch.object(cli.servers, "stop_stale", nothing),
+                patch.object(cli.servers, "start_proxy", nothing),
+                patch.object(cli.servers, "start_mlx", lambda *_a, **_k: "main"),
+                patch.object(cli.servers, "start_mlx_small", lambda *_a, **_k: "small"),
+                patch.object(cli.servers, "warmup", nothing),
+                patch.object(cli.servers, "supervise", nothing),
+                patch.object(cli.clients, "write_client_configs",
+                             lambda _cfg, _model, _small, max_input: configs.append(max_input)),
+                patch.object(cli.hf, "local_gguf_files", lambda *_: []),
+                patch.object(cli.hf, "repo_gguf_files", lambda *_: None),
+                patch.object(cli.hf, "missing_files", lambda *_: []),
+                patch.object(cli.hf, "is_cached", lambda *_: True),
+                patch.object(cli.hf, "model_disk_bytes", lambda *_: 11 * GB),
+                patch.object(cli.hf, "packed_format", lambda *_: None),
+                patch.object(cli.hf, "model_kv_per_token", lambda *_: 65536),
+                patch.object(cli.hf, "model_ctx", lambda *_: 262144),
+                patch.object(cli.psutil, "virtual_memory",
+                             lambda: SimpleNamespace(available=available)),
+                patch.object(cli.sys.stdin, "isatty", return_value=False),
+                patch.dict(os.environ, {cli.clients.CONFIG_CONSENT_ENV: "1"}),
+            ]
+            with contextlib.ExitStack() as stack:
+                for stub in stubs:
+                    stack.enter_context(stub)
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                started = cli._boot(cfg, MODEL, None, cli.LaunchProgress(cfg, MODEL))
+            return started, cfg, configs
+
+        with self.subTest("cache is clamped to free RAM"):
+            started, cfg, configs = exercise(20 * GB)
+            self.assertTrue(started)
+            self.assertLess(cfg.prompt_cache_bytes, 16 * GB)
+            self.assertGreater(cfg.prompt_cache_bytes, 0)
+            self.assertGreater(configs[0], 0)
+        with self.subTest("zero context is refused before clients are written"):
+            with self.assertRaisesRegex(SystemExit, "4K context"):
+                exercise(5 * GB)
 
 
 class StartFailureTests(unittest.TestCase):

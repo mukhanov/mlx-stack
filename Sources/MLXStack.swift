@@ -316,8 +316,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectModel(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
-        model.runModel(name)
-        navigation.screen = .models
+        navigation.show(.models)
+        presentWindow()
+        Task {
+            await modelManager.loadInitialIfNeeded()
+            guard let item = modelManager.downloaded.first(where: { $0.id == name }) else {
+                model.actionError = "Open Models to review the launch settings for \(name)."
+                return
+            }
+            modelManager.beginLaunch(item)
+        }
     }
 
     @objc private func quit() {
@@ -432,6 +440,12 @@ struct Snapshot: Decodable {
         let role: String?
     }
 
+    struct ConfigBackup: Decodable {
+        let createdAt: String
+        let model: String
+        let path: String
+    }
+
     struct LogLine: Decodable {
         let tag: String
         let text: String
@@ -474,6 +488,7 @@ struct Snapshot: Decodable {
     let main: Perf
     let small: Perf?
     let clients: [Client]
+    let configBackup: ConfigBackup?
     let logs: [LogLine]
 }
 
@@ -659,6 +674,8 @@ final class PanelModel: ObservableObject {
     @Published private(set) var launch: LaunchProgress?
     @Published var actionError: String?
     @Published var copiedCommand: String?
+    @Published private(set) var latestConfigBackup: Snapshot.ConfigBackup?
+    @Published var confirmConfigRollback = false
     @Published var selectedModel: MonitorModel = .main
     @Published var showCPUCores = false
     @Published var showProcesses = false
@@ -711,8 +728,8 @@ final class PanelModel: ObservableObject {
         }
     }
 
-    func runModel(_ name: String) {
-        guard canSwitch, !modelActionInProgress,
+    func runModel(_ name: String, configWriteConsent: Bool) {
+        guard canSwitch, !modelActionInProgress, configWriteConsent,
               let url = URL(string: "http://127.0.0.1:\(port)/run") else { return }
         modelActionInProgress = true
         actionError = nil
@@ -728,7 +745,10 @@ final class PanelModel: ObservableObject {
                 request.httpMethod = "POST"
                 request.timeoutInterval = 40
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.httpBody = try JSONSerialization.data(withJSONObject: ["model": name])
+                request.httpBody = try JSONSerialization.data(withJSONObject: [
+                    "model": name,
+                    "config_write_consent": configWriteConsent,
+                ])
                 let (data, response) = try await session.data(for: request)
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if status != 202 {
@@ -769,6 +789,33 @@ final class PanelModel: ObservableObject {
                 }
             } catch {
                 actionError = "Couldn't unload \(name). \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func rollbackLatestConfig() {
+        guard !modelActionInProgress,
+              let url = URL(string: "http://127.0.0.1:\(port)/rollback") else { return }
+        modelActionInProgress = true
+        actionError = nil
+        Task {
+            defer { modelActionInProgress = false }
+            do {
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = Data("{}".utf8)
+                let (data, response) = try await session.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if status != 200 {
+                    let payload = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+                    throw NSError(domain: "MLXStack", code: status,
+                                  userInfo: [NSLocalizedDescriptionKey:
+                                      payload?["error"] ?? "config rollback failed"])
+                }
+                latestConfigBackup = nil
+            } catch {
+                actionError = "Couldn't restore agent configs. \(error.localizedDescription)"
             }
         }
     }
@@ -916,6 +963,7 @@ final class PanelModel: ObservableObject {
         lastUptime = snap.uptimeSeconds
         availableModels = snap.availableModels
         canSwitch = snap.canSwitch
+        latestConfigBackup = snap.configBackup
         mainRunning = snap.ports.main.up
         let mainStep = stepTok(&tokMain, snap.main, &ringTok)
         stepRequests(&requestMain, snap.main.requests, ring: &ringRequests)
