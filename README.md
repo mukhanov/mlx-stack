@@ -48,7 +48,7 @@ open -a "MLX Stack"
 
 The cask puts `MLX Stack.app` in `/Applications`. The backend and `uv` travel inside the bundle; no Python installation or terminal setup is needed.
 
-Prefer a file? Download [`releases/MLXStack-v0.1.6.zip`](https://raw.githubusercontent.com/mukhanov/mlx-stack/v0.1.6/releases/MLXStack-v0.1.6.zip) and unzip it into `/Applications`. Current releases are ad-hoc signed, not Developer ID signed or notarized, so macOS Gatekeeper can warn about or block the app.
+Prefer a file? Download [`releases/MLXStack-v0.1.7.zip`](https://raw.githubusercontent.com/mukhanov/mlx-stack/v0.1.7/releases/MLXStack-v0.1.7.zip) and unzip it into `/Applications`. Current releases are ad-hoc signed, not Developer ID signed or notarized, so macOS Gatekeeper can warn about or block the app.
 
 On first launch the app creates `~/.mlx-stack/mlx-stack-venv`, obtains Python 3.12 if needed and installs the backend's dependencies. A fresh setup needs internet access; catalog refreshes, model downloads and managed backend downloads need it later too. An existing `~/.ollmlx` is migrated to `~/.mlx-stack` and kept as a compatibility symlink.
 
