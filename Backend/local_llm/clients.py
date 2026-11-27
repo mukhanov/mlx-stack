@@ -8,6 +8,9 @@ import json
 import os
 import re
 import shutil
+import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import hf, ui
@@ -16,6 +19,183 @@ from .models import GGUF_LORAS
 from .net import HOST
 
 _ROLE_KEY = re.compile(r"^\s+([^\s#\"'][^:]*):\s*(.*?)\s*$")
+CONFIG_CONSENT_ENV = "MLX_STACK_CONFIG_WRITE_CONSENT"
+
+
+def _config_paths(cfg) -> list[Path]:
+    """Every path the writer may create, replace or remove."""
+    configs = cfg.home / "configs"
+    opencode = (Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
+                / "opencode" / "opencode.json")
+    return [
+        configs / "pi-models.json",
+        configs / "omp-models.json",
+        configs / "omp-config.yml",
+        configs / "opencode.json",
+        cfg.claude_cfg,
+        configs / "dsh-ollmlx.yml",
+        Path("~/.pi/agent/models.json").expanduser(),
+        Path("~/.omp/agent/models.json").expanduser(),
+        Path("~/.omp/agent/config.yml").expanduser(),
+        Path("~/.omp/agent/models.yml").expanduser(),
+        opencode,
+    ]
+
+
+def config_preview(cfg) -> dict:
+    """Paths shown before the user consents; no config is read or changed."""
+    return {
+        "files": [str(path) for path in dict.fromkeys(_config_paths(cfg))],
+        "backup_root": str(cfg.home / "config-backups"),
+    }
+
+
+def confirm_config_writes(cfg) -> bool:
+    """CLI consent; the app sends CONFIG_CONSENT_ENV after its own preview."""
+    if os.environ.get(CONFIG_CONSENT_ENV) == "1":
+        return True
+    preview = config_preview(cfg)
+    ui.info("Agent configuration changes require approval:")
+    for path in preview["files"]:
+        print(f"  {path}")
+    print(f"  backups: {preview['backup_root']}")
+    if not sys.stdin.isatty():
+        return False
+    try:
+        answer = input("Back up and update these agent configuration files? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower().startswith("y")
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        if path.exists() and not path.is_symlink():
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _atomic_copy(source: Path, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    os.close(fd)
+    try:
+        shutil.copy2(source, tmp)
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _replace_symlink(external: Path, target: Path) -> None:
+    external.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{external.name}.", dir=external.parent)
+    os.close(fd)
+    Path(tmp).unlink()
+    try:
+        Path(tmp).symlink_to(target)
+        os.replace(tmp, external)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _load_manifest(cfg, backup: Path) -> dict:
+    manifest = json.loads((backup / "manifest.json").read_text())
+    allowed = {str(path) for path in _config_paths(cfg)}
+    if (manifest.get("version") != 1
+            or not isinstance(manifest.get("files"), list)
+            or any(row.get("path") not in allowed for row in manifest["files"])):
+        raise ValueError(f"invalid agent config backup: {backup}")
+    return manifest
+
+
+def _backup_configs(cfg, model: str) -> Path:
+    root = cfg.home / "config-backups"
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = Path(tempfile.mkdtemp(prefix=stamp + "-", dir=root))
+    rows = []
+    try:
+        for index, path in enumerate(dict.fromkeys(_config_paths(cfg))):
+            row = {"path": str(path)}
+            if path.is_symlink():
+                row.update(kind="symlink", target=os.readlink(path))
+            elif path.exists():
+                if not path.is_file():
+                    raise ValueError(f"not a config file or symlink: {path}")
+                stored = backup / f"{index}.config"
+                shutil.copy2(path, stored)
+                row.update(kind="file", stored=stored.name)
+            else:
+                row["kind"] = "absent"
+            rows.append(row)
+        _atomic_write(backup / "manifest.json", json.dumps({
+            "version": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "files": rows,
+        }, indent=2) + "\n")
+        return backup
+    except BaseException:
+        shutil.rmtree(backup, ignore_errors=True)
+        raise
+
+
+def _restore_backup(cfg, backup: Path) -> None:
+    manifest = _load_manifest(cfg, backup)
+    for row in manifest["files"]:
+        path = Path(row["path"])
+        kind = row["kind"]
+        if kind == "file":
+            _atomic_copy(backup / row["stored"], path)
+        elif kind == "symlink":
+            _replace_symlink(path, Path(row["target"]))
+        elif kind == "absent":
+            if path.is_dir() and not path.is_symlink():
+                raise ValueError(f"refusing to remove a directory: {path}")
+            path.unlink(missing_ok=True)
+        else:
+            raise ValueError(f"unknown config backup entry: {kind}")
+
+
+def _backup_summary(manifest: dict, backup: Path) -> dict:
+    return {"created_at": manifest["created_at"], "model": manifest["model"],
+            "path": str(backup)}
+
+
+def latest_config_backup(cfg) -> dict | None:
+    root = cfg.home / "config-backups"
+    try:
+        candidates = sorted(root.iterdir(), reverse=True)
+    except OSError:
+        return None
+    for backup in candidates:
+        try:
+            return _backup_summary(_load_manifest(cfg, backup), backup)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return None
+
+
+def rollback_latest_config_backup(cfg) -> dict:
+    root = cfg.home / "config-backups"
+    candidates = sorted(root.iterdir(), reverse=True) if root.exists() else []
+    for backup in candidates:
+        try:
+            manifest = _load_manifest(cfg, backup)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+        _restore_backup(cfg, backup)
+        summary = _backup_summary(manifest, backup)
+        shutil.rmtree(backup)
+        return summary
+    raise SystemExit("no agent configuration backups")
 
 
 def _config_target(cfg, external: Path, name: str) -> Path:
@@ -25,23 +205,21 @@ def _config_target(cfg, external: Path, name: str) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     if not target.exists():
         if external.exists():
-            shutil.copy2(external, target)
+            _atomic_copy(external, target)
         else:
-            target.touch()
+            _atomic_write(target, "")
+    elif external.exists() and not external.is_symlink():
+        if external.read_bytes() != target.read_bytes():
+            raise ValueError(
+                f"{external} and {target} differ; reconcile them or restore "
+                "the symlink before loading a model")
     return target
 
 
 def _ensure_link(external: Path, target: Path) -> None:
-    external.parent.mkdir(parents=True, exist_ok=True)
-    if external.is_symlink():
-        if external.resolve() != target.resolve():
-            external.unlink()
-            external.symlink_to(target)
-    elif external.exists():
-        external.unlink()
-        external.symlink_to(target)
-    else:
-        external.symlink_to(target)
+    if external.is_symlink() and external.resolve() == target.resolve():
+        return
+    _replace_symlink(external, target)
 
 
 def _read_json(path: Path) -> dict:
@@ -97,7 +275,7 @@ def _write_omp_smol_role(cfg, small: bool) -> None:
         ui.warn(f"{external} does not keep modelRoles as a plain block —"
                 f" add `smol: {role}` under it by hand")
     elif edited != lines:
-        target.write_text("\n".join(edited) + "\n")
+        _atomic_write(target, "\n".join(edited) + "\n")
         ui.ok(f"{external} (smol role)")
     _ensure_link(external, target)
 
@@ -114,7 +292,7 @@ def _entry(mid: str, name: str, ctx: int, reasoning: bool) -> dict:
     }
 
 
-def write_client_configs(cfg, model: str, small: bool, max_input: int) -> None:
+def _write_client_configs(cfg, model: str, small: bool, max_input: int) -> None:
     # the advertised context is the KV-safe budget, not the config.json
     # maximum: past the prompt-cache ceiling the model dies on the next
     # cache extension (Metal OOM), so clients must compact earlier
@@ -145,7 +323,7 @@ def write_client_configs(cfg, model: str, small: bool, max_input: int) -> None:
             "apiKey": cfg.api_key,
             "models": models,
         }
-        target.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        _atomic_write(target, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
         _ensure_link(external, target)
         ui.ok(str(external))
 
@@ -159,7 +337,7 @@ def write_client_configs(cfg, model: str, small: bool, max_input: int) -> None:
     _write_dsh(cfg, model, small, ctx)
 
     cfg.claude_cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.claude_cfg.write_text(json.dumps({
+    _atomic_write(cfg.claude_cfg, json.dumps({
         "env": {
             "ANTHROPIC_BASE_URL": f"http://{HOST}:{cfg.proxy_port}",
             "ANTHROPIC_AUTH_TOKEN": cfg.api_key,
@@ -211,7 +389,7 @@ def _write_opencode(cfg, model: str, small: bool, ctx: int) -> None:
         data["small_model"] = helper
     elif not small and data.get("small_model") == helper:
         data.pop("small_model")
-    target.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    _atomic_write(target, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     _ensure_link(external, target)
     ui.ok(str(external).replace(str(Path.home()), "~"))
 
@@ -236,7 +414,7 @@ def _write_dsh(cfg, model: str, small: bool, ctx: int) -> None:
         for mid, name, window in entries)
     target = cfg.home / "configs" / "dsh-ollmlx.yml"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(f"""# MLX Stack as a custom model API in DeepSeek Harness.
+    _atomic_write(target, f"""# MLX Stack as a custom model API in DeepSeek Harness.
 # Apply with: dsh web --patch {str(target).replace(str(Path.home()), "~")}
 - id: llm-pi-ai
   config:
@@ -251,6 +429,18 @@ def _write_dsh(cfg, model: str, small: bool, ctx: int) -> None:
 {models}
 """)
     ui.ok(str(target))
+
+
+def write_client_configs(cfg, model: str, small: bool, max_input: int) -> Path:
+    """Back up every touched path; restore all of them if any write fails."""
+    backup = _backup_configs(cfg, model)
+    try:
+        _write_client_configs(cfg, model, small, max_input)
+    except BaseException:
+        _restore_backup(cfg, backup)
+        raise
+    ui.ok(f"agent config backup: {backup}")
+    return backup
 
 
 def client_configs(cfg) -> list[dict]:

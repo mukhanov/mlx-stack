@@ -1,15 +1,12 @@
 """llama.cpp backend: a managed llama-server binary (GGUF models) and a
 minimal GGUF header parser.
 
-llama.cpp ships no pip package and its `/releases/latest` tag carries no
-binaries — real builds are per-commit prereleases tagged b<N> with assets
-like `llama-b<N>-bin-macos-arm64.tar.gz` (researched 2026-10-26). We
-download one known-good build into ~/.mlx-stack/llama.cpp/llama-b<N>/ and pin
-it there: no silent upgrades, re-download only when the pin is missing.
-
-The binary needs its dylibs next to it (rpath-relative), so the whole
-extracted directory is kept, versioned by build id."""
-import json
+Each MLX Stack release pins a reviewed macOS arm64 llama.cpp build and its
+SHA-256. The archive is verified before extraction and the extracted directory
+is kept by build id. Upgrades are explicit code changes, not silent upgrades.
+The binary needs its dylibs next to it (rpath-relative), so the whole extracted
+directory is retained."""
+import hashlib
 import shutil
 import struct
 import tarfile
@@ -20,13 +17,14 @@ from pathlib import Path
 from . import ui
 from .config import stack_home
 
-_RELEASES = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10"
+_LLAMA_TAG = "b12776"
+_LLAMA_SHA256 = "cb0c5c97a1a4ad50a0d64e228a67694de5c3a876d1ae0077b39e3c2381f3a039"
 _ASSET = "llama-{tag}-bin-macos-arm64.tar.gz"
+_DOWNLOAD = "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/{asset}"
+
 
 def _fetch(url, timeout: int, tries: int = 4):
-    """urlopen with flaky-network retries: api.github.com and the release
-    CDN die mid-TLS now and then on the same proxies hf.download retries
-    around — a fresh attempt is usually enough."""
+    """urlopen with flaky-network retries for the release CDN."""
     last: Exception | None = None
     for n in range(1, tries + 1):
         try:
@@ -42,35 +40,29 @@ def _llama_root() -> Path:
     return stack_home() / "llama.cpp"
 
 
-def _latest_asset() -> tuple[str, str]:
-    """(tag, download URL) of the newest prerelease with a macOS arm64
-    asset — releases iterate newest-first, several per day."""
-    req = urllib.request.Request(_RELEASES, headers={"accept": "application/json"})
-    with _fetch(req, timeout=30) as r:
-        releases = json.loads(r.read().decode())
-    for rel in releases:
-        tag = rel.get("tag_name", "")
-        for a in rel.get("assets", []):
-            if a.get("name") == _ASSET.format(tag=tag):
-                return tag, a["browser_download_url"]
-    raise RuntimeError("no macos-arm64 asset in the 10 newest llama.cpp releases")
-
-
 def _download_build(root: Path) -> str:
-    tag, url = _latest_asset()
+    tag = _LLAMA_TAG
+    url = _DOWNLOAD.format(tag=tag, asset=_ASSET.format(tag=tag))
     ui.info(f"Downloading llama.cpp {tag} (~16MB) from GitHub releases")
     root.mkdir(parents=True, exist_ok=True)
     tar_path = root / f"llama-{tag}.tar.gz"
+    digest = hashlib.sha256()
     with _fetch(url, timeout=300) as r, open(tar_path, "wb") as f:
         total = int(r.headers.get("content-length") or 0)
         done = 0
         while chunk := r.read(1 << 20):
             f.write(chunk)
+            digest.update(chunk)
             done += len(chunk)
             if total:
                 print(f"\r   {done * 100 / total:5.1f}%"
                       f" ({done // 1024 // 1024}MB)", end="", flush=True)
     print()
+    actual = digest.hexdigest()
+    if actual != _LLAMA_SHA256:
+        tar_path.unlink(missing_ok=True)
+        raise SystemExit(f"   llama.cpp {tag}: sha256 mismatch after download "
+                         f"(expected {_LLAMA_SHA256}, got {actual})")
     try:
         # filter="data" (py3.12+): refuses path traversal / absolute members
         with tarfile.open(tar_path) as tf:
@@ -89,8 +81,7 @@ def _download_build(root: Path) -> str:
 def ensure_llama_server(override: str) -> str:
     """Absolute path to a llama-server binary: the path from
     OLLMLX_LLAMA_SERVER when it names a file > one on PATH > the managed
-    download under ~/.mlx-stack/llama.cpp (pinned to the build recorded in
-    build.txt)."""
+    release-pinned download under ~/.mlx-stack/llama.cpp."""
     if override:
         p = Path(override).expanduser()
         if p.is_file():
@@ -100,12 +91,9 @@ def ensure_llama_server(override: str) -> str:
     if found:
         return found
     root = _llama_root()
-    pin = root / "build.txt"
-    if pin.is_file():
-        cand = root / f"llama-{pin.read_text().strip()}" / "llama-server"
-        if cand.is_file():
-            return str(cand)
-        # the pinned dir was deleted — fall through and fetch fresh
+    server = root / f"llama-{_LLAMA_TAG}" / "llama-server"
+    if server.is_file():
+        return str(server)
     return _download_build(root)
 
 

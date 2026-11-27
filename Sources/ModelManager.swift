@@ -85,6 +85,11 @@ struct LaunchParameters: Decodable {
     var maxTokens = 32768
 }
 
+struct ConfigPreview: Decodable {
+    let files: [String]
+    let backupRoot: String
+}
+
 struct LaunchSettings: Decodable {
     let settings: LaunchParameters
     let defaults: LaunchParameters
@@ -97,6 +102,7 @@ struct LaunchSettings: Decodable {
     let budgetAvailableBytes: Int64
     let weightsBytes: Int64
     let cacheLimitBytes: Int64
+    let configPreview: ConfigPreview
 }
 
 enum CatalogSort: String, CaseIterable, Identifiable {
@@ -151,6 +157,8 @@ final class ModelManagerModel: ObservableObject {
     @Published private(set) var launchIsLoaded = false
     @Published private(set) var launchWeightsBytes: Int64 = 0
     @Published private(set) var launchCacheLimitBytes: Int64 = 0
+    @Published private(set) var launchConfigPreview = ConfigPreview(files: [], backupRoot: "")
+    @Published var approveConfigWrites = false
     @Published private(set) var savingLaunch = false
     @Published var launchError: String?
     @Published var downloadedHeight = 218.0
@@ -381,6 +389,7 @@ final class ModelManagerModel: ObservableObject {
     func beginLaunch(_ item: ModelInfo) {
         launchError = nil
         launchSettingsLoaded = false
+        approveConfigWrites = false
         pendingLaunch = item
     }
 
@@ -408,6 +417,7 @@ final class ModelManagerModel: ObservableObject {
             launchIsLoaded = settings.isLoaded
             launchWeightsBytes = settings.weightsBytes
             launchCacheLimitBytes = settings.cacheLimitBytes
+            launchConfigPreview = settings.configPreview
             clampLaunchDraft()
             launchSettingsLoaded = true
         } catch {
@@ -431,6 +441,7 @@ final class ModelManagerModel: ObservableObject {
 
     func saveAndLoad(_ item: ModelInfo, panel: PanelModel) async {
         guard !savingLaunch, !loadingLaunch, launchSettingsLoaded,
+              approveConfigWrites,
               let url = URL(string: "http://127.0.0.1:\(port)/settings") else { return }
         savingLaunch = true
         defer { savingLaunch = false }
@@ -455,7 +466,7 @@ final class ModelManagerModel: ObservableObject {
             let (data, response) = try await session.data(for: request)
             try Self.requireSuccess(response, data: data)
             pendingLaunch = nil
-            panel.runModel(item.id)
+            panel.runModel(item.id, configWriteConsent: true)
         } catch {
             launchError = error.localizedDescription
         }
@@ -1128,6 +1139,28 @@ private struct LaunchParametersView: View {
                 }
                 .padding(.vertical, 6)
             }
+            GroupBox("Agent configuration") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Loading updates MLX Stack provider entries and harness symlinks. Review every affected path before approving.")
+                        .font(.callout)
+                        .foregroundStyle(C.dim)
+                    ForEach(model.launchConfigPreview.files, id: \.self) { path in
+                        Text(path)
+                            .font(mono(9))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                    Text("Backups: \(model.launchConfigPreview.backupRoot)")
+                        .font(mono(9))
+                        .foregroundStyle(C.dim)
+                        .textSelection(.enabled)
+                    Toggle("Back up and apply these agent configuration changes",
+                           isOn: $model.approveConfigWrites)
+                        .accessibilityLabel("Approve agent configuration backup and changes")
+                }
+                .padding(.vertical, 6)
+            }
             if let error = model.launchError {
                 ErrorBanner(message: "Couldn't load saved settings. \(error)")
             }
@@ -1151,7 +1184,8 @@ private struct LaunchParametersView: View {
                 Button("Load model") { Task { await model.saveAndLoad(item, panel: panel) } }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(model.savingLaunch || model.loadingLaunch || !model.launchSettingsLoaded)
+                    .disabled(model.savingLaunch || model.loadingLaunch
+                              || !model.launchSettingsLoaded || !model.approveConfigWrites)
             }
             }
         }

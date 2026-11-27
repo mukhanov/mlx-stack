@@ -184,6 +184,86 @@ class ConfigHomeTests(unittest.TestCase):
                        if item["name"] == "dsh")
         self.assertEqual(command, "dsh web --patch ~/.mlx-stack/configs/dsh-ollmlx.yml")
 
+    def test_preview_does_not_touch_agent_configs(self):
+        cfg = Config.from_env()
+        preview = clients.config_preview(cfg)
+        self.assertIn(str(self.home / ".pi/agent/models.json"), preview["files"])
+        self.assertEqual(preview["backup_root"], str(self.stack / "config-backups"))
+        self.assertFalse((self.home / ".pi").exists())
+        self.assertFalse((self.home / ".omp").exists())
+
+    def test_rollback_restores_regular_files_and_removes_new_configs(self):
+        opencode = self.home / ".config/opencode/opencode.json"
+        opencode.parent.mkdir(parents=True)
+        opencode.write_text('{"theme":"dark"}\n')
+        omp = self.home / ".omp/agent/config.yml"
+        omp.parent.mkdir(parents=True)
+        omp.write_text(OMP_CONFIG)
+        cfg = Config.from_env()
+        clients.write_client_configs(cfg, "org/model", small=True, max_input=8192)
+        self.assertTrue(opencode.is_symlink())
+        self.assertIsNotNone(clients.latest_config_backup(cfg))
+
+        restored = clients.rollback_latest_config_backup(cfg)
+        self.assertEqual(restored["model"], "org/model")
+        self.assertFalse(opencode.is_symlink())
+        self.assertEqual(opencode.read_text(), '{"theme":"dark"}\n')
+        self.assertFalse(omp.is_symlink())
+        self.assertEqual(omp.read_text(), OMP_CONFIG)
+        for path in (self.home / ".pi/agent/models.json",
+                     self.home / ".omp/agent/models.json",
+                     cfg.claude_cfg,
+                     self.stack / "configs/dsh-ollmlx.yml"):
+            self.assertFalse(path.exists() or path.is_symlink(), path)
+        self.assertIsNone(clients.latest_config_backup(cfg))
+
+    def test_rollback_restores_the_original_symlink_target(self):
+        original = self.home / "original-pi.json"
+        original.write_text('{"providers":{}}\n')
+        external = self.home / ".pi/agent/models.json"
+        external.parent.mkdir(parents=True)
+        external.symlink_to(original)
+        cfg = Config.from_env()
+        clients.write_client_configs(cfg, "org/model", small=False, max_input=8192)
+        self.assertEqual(external.resolve(), (self.stack / "configs/pi-models.json").resolve())
+
+        clients.rollback_latest_config_backup(cfg)
+        self.assertTrue(external.is_symlink())
+        self.assertEqual(os.readlink(external), str(original))
+        self.assertEqual(external.read_text(), '{"providers":{}}\n')
+
+    def test_a_diverged_regular_config_is_not_replaced(self):
+        cfg = Config.from_env()
+        clients.write_client_configs(cfg, "org/model", small=False, max_input=8192)
+        external = self.home / ".pi/agent/models.json"
+        canonical = self.stack / "configs/pi-models.json"
+        before = canonical.read_bytes()
+        external.unlink()
+        external.write_text('{"custom":true}\n')
+
+        with self.assertRaisesRegex(ValueError, "differ"):
+            clients.write_client_configs(cfg, "org/other", small=False, max_input=8192)
+        self.assertFalse(external.is_symlink())
+        self.assertEqual(external.read_text(), '{"custom":true}\n')
+        self.assertEqual(canonical.read_bytes(), before)
+
+    def test_a_failed_write_restores_the_whole_transaction(self):
+        opencode = self.home / ".config/opencode/opencode.json"
+        opencode.parent.mkdir(parents=True)
+        opencode.write_text('{"theme":"dark"}\n')
+        cfg = Config.from_env()
+        with patch.object(clients, "_write_opencode", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                clients.write_client_configs(cfg, "org/model", small=False,
+                                             max_input=8192)
+        for path in (self.home / ".pi/agent/models.json",
+                     self.home / ".omp/agent/models.json",
+                     self.stack / "configs/pi-models.json",
+                     self.stack / "configs/omp-models.json"):
+            self.assertFalse(path.exists() or path.is_symlink(), path)
+        self.assertFalse(opencode.is_symlink())
+        self.assertEqual(opencode.read_text(), '{"theme":"dark"}\n')
+
     def test_model_settings_override_the_stack_wide_ones_and_round_trip(self):
         cfg = Config.from_env()
         self.assertEqual(cfg.model_settings("org/model")["max_ctx"], cfg.max_ctx)

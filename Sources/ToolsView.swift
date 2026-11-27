@@ -28,6 +28,15 @@ struct ToolsView: View {
                             .font(.callout)
                             .foregroundStyle(C.dim)
                         if let d {
+                            if let backup = model.latestConfigBackup {
+                                configBackup(backup)
+                            }
+                            if let error = model.actionError {
+                                Text(error)
+                                    .font(.callout)
+                                    .foregroundStyle(C.red)
+                                    .textSelection(.enabled)
+                            }
                             ForEach(Array(d.clients.enumerated()), id: \.offset) { _, client in
                                 HarnessConfigRow(client: client, model: model)
                             }
@@ -41,6 +50,37 @@ struct ToolsView: View {
                 }
             }
         }
+        .alert("Restore the latest agent config backup?",
+               isPresented: $model.confirmConfigRollback) {
+            Button("Cancel", role: .cancel) { }
+            Button("Restore", role: .destructive) { model.rollbackLatestConfig() }
+        } message: {
+            if let backup = model.latestConfigBackup {
+                Text("Restore \(backup.model) settings from \(backup.createdAt). Current agent configs will be replaced.")
+            }
+        }
+    }
+
+    private func configBackup(_ backup: Snapshot.ConfigBackup) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Agent configuration backup")
+                .font(.headline)
+                .foregroundStyle(C.fg)
+            Text("\(backup.createdAt) · \(backup.model)")
+                .font(.callout)
+                .foregroundStyle(C.dim)
+            Text(backup.path)
+                .font(mono(10))
+                .foregroundStyle(C.dim)
+                .textSelection(.enabled)
+            HStack {
+                Button("Show in Finder") { reveal(backup.path) }
+                Button("Restore latest backup") { model.confirmConfigRollback = true }
+                    .disabled(model.modelActionInProgress)
+            }
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func stackFiles(home: String) -> some View {
