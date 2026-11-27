@@ -48,7 +48,16 @@ open -a "MLX Stack"
 
 The cask puts `MLX Stack.app` in `/Applications`. The backend and `uv` travel inside the bundle; no Python installation or terminal setup is needed.
 
-Prefer a file? Download [`releases/MLXStack-v0.1.7.zip`](https://raw.githubusercontent.com/mukhanov/mlx-stack/v0.1.7/releases/MLXStack-v0.1.7.zip) and unzip it into `/Applications`. Current releases are ad-hoc signed, not Developer ID signed or notarized, so macOS Gatekeeper can warn about or block the app.
+Prefer a file? Download [`releases/MLXStack-v0.1.7.zip`](https://github.com/mukhanov/mlx-stack/releases/download/v0.1.7/MLXStack-v0.1.7.zip) and [its SHA-256 manifest](https://github.com/mukhanov/mlx-stack/releases/download/v0.1.7/MLXStack-v0.1.7.zip.sha256), verify the archive with `shasum -a 256 -c MLXStack-v0.1.7.zip.sha256`, and unzip it into `/Applications`.
+
+Current releases are ad-hoc signed, not Developer ID signed or notarized, so macOS Gatekeeper can warn about or block the app and its bundled `uv`. After verifying the checksum, explicitly allow the verified bundle to run:
+
+```console
+xattr -dr com.apple.quarantine "/Applications/MLX Stack.app"
+open -a "MLX Stack"
+```
+
+This removes quarantine from the entire app and is required for the bundled backend. Skip it only if you understand and accept that tradeoff. The Homebrew cask prints the same warning and performs this step after Homebrew verifies the archive SHA-256.
 
 On first launch the app creates `~/.mlx-stack/mlx-stack-venv`, obtains Python 3.12 if needed and installs the backend's dependencies. A fresh setup needs internet access; catalog refreshes, model downloads and managed backend downloads need it later too. An existing `~/.ollmlx` is migrated to `~/.mlx-stack` and kept as a compatibility symlink.
 
